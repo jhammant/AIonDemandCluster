@@ -8,12 +8,21 @@ import shutil
 from pathlib import Path
 
 import httpx
+from platformdirs import user_config_dir
 
-ENV_FILE = Path(".env")
+ENV_FILE = Path(".env")  # project-local
 ENV_EXAMPLE = Path(".env.example")
+GLOBAL_ENV = Path(user_config_dir("aiod", appauthor=False)) / ".env"
 
 
-def read_env(path: Path = ENV_FILE) -> dict[str, str]:
+def env_path() -> Path:
+    """Where `init`/`doctor` read & write keys: the project .env if you're inside a
+    project, otherwise the global ~/.config/aiod/.env (used by a global install)."""
+    return ENV_FILE if ENV_FILE.exists() else GLOBAL_ENV
+
+
+def read_env(path: Path | None = None) -> dict[str, str]:
+    path = path or env_path()
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -26,9 +35,11 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
     return values
 
 
-def set_env_values(updates: dict[str, str], path: Path = ENV_FILE) -> None:
+def set_env_values(updates: dict[str, str], path: Path | None = None) -> None:
     """Update keys in-place, preserving existing comments/order; append new keys.
     Seeds from .env.example the first time so the file keeps its documentation."""
+    path = path or env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists() and ENV_EXAMPLE.exists():
         path.write_text(ENV_EXAMPLE.read_text())
 

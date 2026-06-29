@@ -127,10 +127,14 @@ def _one_request(
                 except json.JSONDecodeError:
                     continue
                 choices = obj.get("choices") or []
-                if choices and (choices[0].get("delta") or {}).get("content"):
-                    if ttft is None:
-                        ttft = time.time() - start
-                    chunk_tokens += 1
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    # reasoning models (GLM-5, DeepSeek-R1, ...) stream into
+                    # reasoning_content; count it as generated work too.
+                    if delta.get("content") or delta.get("reasoning_content"):
+                        if ttft is None:
+                            ttft = time.time() - start
+                        chunk_tokens += 1
                 if obj.get("usage"):
                     usage_tokens = obj["usage"].get("completion_tokens", 0)
     except httpx.HTTPError as e:

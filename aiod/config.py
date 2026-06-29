@@ -5,10 +5,18 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
+from platformdirs import user_config_dir
 
-load_dotenv()  # read .env from the current working directory if present
+# Project-local .env wins (override=False keeps the first-loaded values); a global
+# ~/.config/aiod/.env is the fallback so a globally-installed `aiod` finds your keys
+# from any directory. OS environment variables take precedence over both.
+GLOBAL_ENV = Path(user_config_dir("aiod", appauthor=False)) / ".env"
+
+load_dotenv()  # CWD .env (project)
+load_dotenv(GLOBAL_ENV)  # global fallback
 
 
 @dataclass

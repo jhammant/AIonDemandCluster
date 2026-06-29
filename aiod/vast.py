@@ -111,6 +111,7 @@ class VastClient:
         max_price: float | None = None,
         min_reliability: float = 0.95,
         min_compute_cap: int = 800,
+        min_inet_mbps: int = 400,
         gpu_names: list[str] | None = None,
         limit: int = 30,
     ) -> list[Offer]:
@@ -128,9 +129,10 @@ class VastClient:
             # pre-Ampere (V100/T4/P100). Raised to 890 (Ada) for fp8, which is
             # numerically broken on Ampere (produces garbage); see price_plan.
             "compute_cap": {"gte": min_compute_cap},
-            # Avoid slow-network hosts: the image (~10GB) + weights download there.
-            # A slow node can't even pull the image before the boot timeout.
-            "inet_down": {"gte": 200},
+            # Avoid slow-network hosts: the image + weights download there. The floor
+            # scales with model size in price_plan (a 343GB GGUF on a slow node would
+            # cost a fortune in idle GPU time during the download).
+            "inet_down": {"gte": min_inet_mbps},
             "type": "ondemand",
             "order": [["dph_total", "asc"]],
             "limit": limit,
@@ -255,6 +257,14 @@ class VastClient:
         (the client also throttles + backs off on 429)."""
         # fp8 is only reliable on Ada+ (cc 8.9); on Ampere it yields garbage output.
         min_cc = 890 if plan.quant == "fp8" else 800
+        # Scale the network-speed floor to the download size so big GGUF models don't
+        # land on a slow node (343GB @ 200Mbps = ~3.8h of idle GPU billing).
+        if plan.weights_gb > 150:
+            min_inet = 2000
+        elif plan.weights_gb > 40:
+            min_inet = 1000
+        else:
+            min_inet = 400
         opts = sorted((o for o in plan.options if o.fits), key=lambda o: o.total_vram_gb)
         priced: list[PricedOption] = []
         for opt in opts[:max_candidates]:
@@ -264,6 +274,7 @@ class VastClient:
                 min_disk_gb=min_disk_gb,
                 max_price=max_price,
                 min_compute_cap=min_cc,
+                min_inet_mbps=min_inet,
                 limit=10,
             )
             priced.append(PricedOption(option=opt, offer=offers[0] if offers else None))

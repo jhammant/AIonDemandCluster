@@ -181,7 +181,9 @@ def init():
 @app.command()
 def doctor():
     """Check that keys, the router, and the environment are all good to go."""
-    env = onboard.read_env()
+    # Validate the EFFECTIVE config (env vars + project .env + global ~/.config/aiod/.env),
+    # so this works the same whether run inside the project or from anywhere.
+    s = Settings.load()
     table = Table(title="aiod doctor", show_header=True)
     table.add_column("Check")
     table.add_column("Status")
@@ -190,19 +192,16 @@ def doctor():
         mark = "[green]✓[/]" if ok else "[red]✗[/]"
         table.add_row(name, f"{mark} {detail}")
 
-    key = env.get("VAST_API_KEY", "")
-    if key:
-        ok, msg = onboard.validate_vast_key(key)
+    if s.vast_api_key:
+        ok, msg = onboard.validate_vast_key(s.vast_api_key)
         row("vast.ai key", ok, msg)
     else:
-        row("vast.ai key", False, "not in .env — run `aiod init`")
+        row("vast.ai key", False, "not set — run `aiod init`")
 
-    rp = env.get("RUNPOD_API_KEY", "")
-    ok, msg = onboard.validate_runpod_key(rp)
+    ok, msg = onboard.validate_runpod_key(s.runpod_api_key)
     row("RunPod key", ok, msg)
 
-    token = env.get("HF_TOKEN", "")
-    ok, msg = onboard.validate_hf_token(token)
+    ok, msg = onboard.validate_hf_token(s.hf_token or "")
     row("HuggingFace token", ok, msg)
 
     ccr_path = onboard.ccr_installed()
@@ -505,16 +504,27 @@ def _launch_watcher(idle_minutes: int) -> bool:
     return spawn_detached(idle_minutes, state.STATE_DIR / "watch.log")
 
 
-def _wait_for_endpoint(client, instance_id, timeout_s: float = 1200.0):
+def _wait_for_endpoint(client, instance_id, timeout_s: float = 1200.0, startup_grace: float = 540.0):
+    """Wait for the public port to map. Aborts early if the container never even
+    reaches 'running' within startup_grace — that's a bad host (stuck pulling the
+    image), and waiting the full timeout just wastes money."""
     start = time.time()
+    seen_running = False
     with console.status("Booting container / pulling image...") as status:
         while time.time() - start < timeout_s:
             inst = client.get_instance(instance_id)
             st = client.status_of(inst)
+            if "running" in st.lower():
+                seen_running = True
             ep = client.endpoint_of(inst, CONTAINER_PORT)
             status.update(f"vast status: {st} ({int(time.time() - start)}s)")
             if ep:
                 return ep
+            if not seen_running and (time.time() - start) > startup_grace:
+                console.print(
+                    "[yellow]Host never started the container (slow/bad node) — aborting early.[/]"
+                )
+                return None
             time.sleep(8)
     return None
 
