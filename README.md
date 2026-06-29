@@ -112,7 +112,9 @@ cp .env.example .env
 #   AIOD_MAX_PRICE=6.0      (hard $/hr cap on offers)
 ```
 
-`.env` is gitignored — secrets never reach the public repo.
+`.env` is gitignored — secrets never reach the public repo. Keys are read from (in
+order) **environment variables → project `.env` → global `~/.config/aiod/.env`**, so a
+global install (`pipx install` / `uv tool install`) finds your keys from any directory.
 
 ---
 
@@ -157,9 +159,26 @@ ccr restart && ccr code
 ```bash
 aiod status        # provider status, endpoint, cost so far, time left on the TTL
 aiod ping --tools  # send a test prompt (+ tool call) to confirm it serves
+aiod bench         # benchmark: TTFT, tokens/sec, throughput, $/1M tokens (add -c 8)
 aiod watch --idle 20  # foreground idle watcher (auto-destroys when idle)
 aiod ccr-config    # re-write the CCR config from the tracked instance
 aiod teardown      # destroy the instance and stop billing  ← run this when done
+```
+
+### Engines — vLLM and llama.cpp (GGUF)
+
+`aiod` auto-detects the model format: **safetensors / AWQ / fp8 → vLLM**, and
+**GGUF → llama.cpp** (multi-part shards, multi-GPU, OpenAI endpoint). Force it with
+`--engine vllm|llamacpp`, or pick it in the TUI. The right **tool-call parser** is
+auto-selected per model family (a registry in `aiod/model_configs.py`) so function
+calling works with Claude Code without hand-tuning flags.
+
+```bash
+# A 789B GGUF model on rented GPUs, benchmarked, for a couple of dollars:
+aiod estimate huihui-ai/Huihui-GLM-5.2-abliterated-GGUF        # live $/hr
+aiod spin     huihui-ai/Huihui-GLM-5.2-abliterated-GGUF -q UD-Q3_K_M --idle 30
+aiod bench -c 4   # → tok/s + $/1M tokens
+aiod teardown
 ```
 
 ### Profiles — named presets for spinning up a stack
