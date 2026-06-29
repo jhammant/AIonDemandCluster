@@ -51,7 +51,7 @@ remote box can stay a plain OpenAI-compatible server.
 
 ## Install
 
-> **Early release** — install from source for now. PyPI (`pipx install ai-on-demand`)
+> **Early release** — install from source for now. PyPI (`pipx install aiondemandcluster`)
 > is wired up and coming shortly.
 
 ```bash
@@ -67,7 +67,7 @@ Then run `aiod init` to set up your keys.
 <summary>Once on PyPI (pipx / uv / pip)</summary>
 
 ```bash
-pipx install ai-on-demand     # or: uv tool install ai-on-demand  /  pip install ai-on-demand
+pipx install aiondemandcluster     # or: uv tool install aiondemandcluster  /  pip install aiondemandcluster
 ```
 
 </details>
