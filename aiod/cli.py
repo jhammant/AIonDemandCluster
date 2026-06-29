@@ -530,13 +530,42 @@ def _wait_for_endpoint(client, instance_id, timeout_s: float = 1200.0, startup_g
 
 
 def _wait_for_health(inst: state.Instance, timeout_s: float = 2400.0) -> bool:
-    with console.status("Downloading weights / loading model...") as status:
-        def on_progress(hs, elapsed):
-            status.update(f"{hs.detail} ({int(elapsed)}s)")
+    from .vast import extract_download_progress
 
-        return wait_until_ready(
-            inst.base_url, api_key=inst.api_key, timeout_s=timeout_s, on_progress=on_progress
-        )
+    # A client just for log-tailing (live download %). Best-effort — only vast has it.
+    log_client = None
+    try:
+        log_client = providers.get_client(inst.provider, Settings.load())
+    except Exception:  # noqa: BLE001
+        log_client = None
+    box = {"dl": None, "last": 0.0}
+
+    def on_progress(hs, elapsed, status):
+        msg = f"{hs.detail} ({int(elapsed)}s)"
+        if log_client is not None and hasattr(log_client, "fetch_logs") and elapsed - box["last"] > 20:
+            box["last"] = elapsed
+            try:
+                p = extract_download_progress(log_client.fetch_logs(inst.instance_id))
+                if p:
+                    box["dl"] = p
+            except Exception:  # noqa: BLE001 - progress is best-effort
+                pass
+        if box["dl"]:
+            msg += f"  ·  ⬇ {box['dl']}"
+        status.update(msg)
+
+    try:
+        with console.status("Downloading weights / loading model...") as status:
+            return wait_until_ready(
+                inst.base_url, api_key=inst.api_key, timeout_s=timeout_s,
+                on_progress=lambda hs, el: on_progress(hs, el, status),
+            )
+    finally:
+        if log_client is not None:
+            try:
+                log_client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _print_dry_run(client, offer, cfg, disk, max_price) -> None:

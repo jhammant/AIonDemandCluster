@@ -19,6 +19,7 @@ Key facts encoded here (verified against the vast-cli source):
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass
 
@@ -222,6 +223,26 @@ class VastClient:
     def destroy_instance(self, instance_id: int) -> None:
         self._delete(f"/api/v0/instances/{instance_id}/")
 
+    def fetch_logs(self, instance_id, tail: str = "200") -> str:
+        """Container stdout/stderr (for live download progress). Two-step: request a
+        log dump, then poll the presigned URL (public, no auth) until it's ready."""
+        try:
+            data = self._put(f"/api/v0/instances/request_logs/{instance_id}/", {"tail": tail})
+        except VastError:
+            return ""
+        url = data.get("result_url")
+        if not url:
+            return ""
+        for _ in range(15):
+            time.sleep(0.3)
+            try:
+                r = httpx.get(url, timeout=15)
+            except httpx.HTTPError:
+                continue
+            if r.status_code == 200:
+                return r.text
+        return ""
+
     @staticmethod
     def endpoint_of(inst: dict, container_port: int = 8000) -> tuple[str, int] | None:
         """Extract (public_ip, external_port) once the port is mapped, else None."""
@@ -331,3 +352,28 @@ class VastClient:
 def recommend_disk_gb(weights_gb: float, floor: int = 40) -> int:
     """Disk needs to hold the weights download plus the image and scratch."""
     return max(floor, int(math.ceil(weights_gb * 1.3 + 25)))
+
+
+# A download/progress line in vLLM or llama.cpp/HF stdout, e.g.
+#   "model-00001-of-00005.gguf:  47%|####6     | 3.2G/6.8G [00:12<00:14, 257MB/s]"
+_SIZE_HINT = ("b/s", "mb", "gb", "gib", "mib", "/s", "b/")
+
+
+def extract_download_progress(log_text: str) -> str | None:
+    """Pull the most recent download-progress line out of container logs.
+    tqdm/HF bars overwrite with \\r, so the last segment is the freshest."""
+    if not log_text:
+        return None
+    best: str | None = None
+    for line in log_text.replace("\r", "\n").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        has_pct = "%" in line
+        if (has_pct and any(h in low for h in _SIZE_HINT)) or ("download" in low and has_pct):
+            best = line
+    if best is None:
+        return None
+    best = re.sub(r"\s+", " ", best)
+    return best[:110]

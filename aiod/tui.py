@@ -403,12 +403,35 @@ class AiodTUI(App):
 
         start = time.time()
         health_timeout = 5400 if eng == "llamacpp" else 2400  # GGUF downloads are huge
+        log_client = None
+        try:
+            log_client = providers.get_client(provider, s)
+        except Exception:  # noqa: BLE001
+            log_client = None
+        dl, last_log = None, 0.0
         while time.time() - start < health_timeout:
             hs = check_once(inst.base_url, api_key=inst.api_key)
-            self.call_from_thread(self._log, f"  {hs.detail} ({int(time.time()-start)}s)")
+            el = time.time() - start
+            if log_client is not None and hasattr(log_client, "fetch_logs") and el - last_log > 20:
+                last_log = el
+                try:
+                    from .vast import extract_download_progress
+                    p = extract_download_progress(log_client.fetch_logs(inst.instance_id))
+                    if p:
+                        dl = p
+                except Exception:  # noqa: BLE001 - progress is best-effort
+                    pass
+            self.call_from_thread(
+                self._log, f"  {hs.detail} ({int(el)}s)" + (f"  ·  ⬇ {dl}" if dl else "")
+            )
             if hs.ready:
                 break
             time.sleep(12)
+        if log_client is not None:
+            try:
+                log_client.close()
+            except Exception:  # noqa: BLE001
+                pass
         else:
             self.call_from_thread(self._log, "[yellow]Timed out waiting for model. Check status.[/]")
             self.call_from_thread(self._done_launch)
