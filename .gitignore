@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+*.key
+
+# Local runtime state (tracks the running instance)
+.aiod/
+state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
