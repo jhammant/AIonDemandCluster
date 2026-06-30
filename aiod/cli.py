@@ -233,6 +233,9 @@ def estimate(
     context: int = typer.Option(None, "--context", help="Context length for the KV estimate"),
     concurrency: int = typer.Option(4, "--concurrency", help="Concurrent sequences for KV estimate"),
     max_price: float = typer.Option(None, "--max-price", help="Cap $/hr in the offer search"),
+    gpu: list[str] = typer.Option(
+        None, "--gpu", help="Only consider GPUs whose name contains this (repeatable), e.g. --gpu rtx6000"
+    ),
 ):
     """Size a model from its HuggingFace link and show live provider cost ($0)."""
     provider = provider.lower()
@@ -274,7 +277,7 @@ def estimate(
             with console.status(f"Querying live {provider} offers..."):
                 for p in sizing.plans:
                     disk = recommend_disk_gb(p.weights_gb)
-                    priced = client.price_plan(p, disk, max_price=max_p)
+                    priced = client.price_plan(p, disk, max_price=max_p, gpu_match=gpu or None)
                     best = _pick_cheapest(priced)
                     if best:
                         fit = f"{best.option.num_gpus}x {best.option.tier.name}"
@@ -306,6 +309,9 @@ def spin(
         None, "--quant", "-q", help="vLLM: bf16/fp8/awq-int4 · GGUF: a repo quant tag"
     ),
     max_price: float = typer.Option(None, "--max-price", help="Hard cap $/hr (default from .env)"),
+    gpu: list[str] = typer.Option(
+        None, "--gpu", help="Only rent GPUs whose name contains this (repeatable), e.g. --gpu rtx6000"
+    ),
     ttl: float = typer.Option(None, "--ttl", help="Auto-destroy reminder window, hours"),
     idle: int = typer.Option(
         None, "--idle", help="Auto-shutdown after N idle minutes (starts a local watcher)"
@@ -388,12 +394,13 @@ def spin(
 
     with client_cm as client:
         with console.status("Finding the cheapest GPU that fits..."):
-            priced = client.price_plan(plan, disk, max_price=max_p)
+            priced = client.price_plan(plan, disk, max_price=max_p, gpu_match=gpu or None)
         best = _pick_cheapest(priced)
         if not best:
+            gpu_note = f" matching --gpu {' '.join(gpu)}" if gpu else ""
             console.print(
                 f"[red]No {provider} offer found[/] under ${max_p:.2f}/hr for {m.repo_id} "
-                f"({quant}). Try a higher --max-price or a smaller quant."
+                f"({quant}){gpu_note}. Try a higher --max-price or a smaller quant."
             )
             raise typer.Exit(1)
 

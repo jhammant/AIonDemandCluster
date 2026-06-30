@@ -94,13 +94,20 @@ class RunpodClient:
         self._gpu_types = data.get("data", {}).get("gpuTypes", []) or []
         return self._gpu_types
 
-    def _cheapest_gpu_for(self, vram_gb: float) -> dict | None:
+    def _cheapest_gpu_for(
+        self, vram_gb: float, gpu_match: list[str] | None = None
+    ) -> dict | None:
         """Cheapest SECURE gpu type in the same VRAM class as `vram_gb`."""
+        wanted = ["".join(g.lower().split()) for g in (gpu_match or []) if g.strip()]
         cands: list[tuple[float, dict]] = []
         for g in self._fetch_gpu_types():
             mem, price = g.get("memoryInGb"), g.get("securePrice")
             if not mem or not price or not g.get("secureCloud"):
                 continue
+            if wanted:
+                name = "".join(str(g.get("displayName", g.get("id", ""))).lower().split())
+                if not any(w in name for w in wanted):
+                    continue
             if vram_gb * 0.95 <= mem <= vram_gb * 1.6:
                 cands.append((price, g))
         if not cands:
@@ -109,14 +116,14 @@ class RunpodClient:
 
     def price_plan(
         self, plan: QuantPlan, min_disk_gb: float, max_price: float | None = None,
-        max_candidates: int = 3,
+        max_candidates: int = 3, gpu_match: list[str] | None = None,
     ) -> list[PricedOption]:
         """Price the few least-wasteful configs that fit (mirrors the vast backend;
         all pricing comes from one cached GraphQL call, so this is cheap)."""
         opts = sorted((o for o in plan.options if o.fits), key=lambda o: o.total_vram_gb)
         priced: list[PricedOption] = []
         for opt in opts[:max_candidates]:
-            g = self._cheapest_gpu_for(opt.tier.vram_gb)
+            g = self._cheapest_gpu_for(opt.tier.vram_gb, gpu_match=gpu_match)
             offer = None
             if g:
                 total = g["securePrice"] * opt.num_gpus

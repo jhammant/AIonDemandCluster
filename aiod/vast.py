@@ -114,6 +114,7 @@ class VastClient:
         min_compute_cap: int = 800,
         min_inet_mbps: int = 400,
         gpu_names: list[str] | None = None,
+        gpu_match: list[str] | None = None,
         limit: int = 30,
     ) -> list[Offer]:
         query: dict = {
@@ -136,7 +137,9 @@ class VastClient:
             "inet_down": {"gte": min_inet_mbps},
             "type": "ondemand",
             "order": [["dph_total", "asc"]],
-            "limit": limit,
+            # When substring-filtering by GPU name we fetch a wider pool and trim
+            # client-side, since vast's gpu_name filter only does exact matches.
+            "limit": max(limit, 50) if gpu_match else limit,
         }
         if max_price is not None:
             query["dph_total"] = {"lte": float(max_price)}
@@ -144,8 +147,15 @@ class VastClient:
             query["gpu_name"] = {"in": gpu_names}
 
         data = self._post("/api/v0/bundles/", query)
-        offers = data.get("offers", []) or []
-        return [self._parse_offer(o) for o in offers]
+        offers = [self._parse_offer(o) for o in (data.get("offers", []) or [])]
+        if gpu_match:
+            wanted = ["".join(g.lower().split()) for g in gpu_match if g.strip()]
+            offers = [
+                o for o in offers
+                if any(w in "".join(o.gpu_name.lower().split()) for w in wanted)
+            ]
+            offers = offers[:limit]
+        return offers
 
     @staticmethod
     def _parse_offer(o: dict) -> Offer:
@@ -269,6 +279,7 @@ class VastClient:
         min_disk_gb: float,
         max_price: float | None = None,
         max_candidates: int = 3,
+        gpu_match: list[str] | None = None,
     ) -> list[PricedOption]:
         """Price the few least-wasteful GPU configs that fit and return them all
         (the caller picks the cheapest by actual price). We sort fitting configs by
@@ -296,6 +307,7 @@ class VastClient:
                 max_price=max_price,
                 min_compute_cap=min_cc,
                 min_inet_mbps=min_inet,
+                gpu_match=gpu_match,
                 limit=10,
             )
             priced.append(PricedOption(option=opt, offer=offers[0] if offers else None))
