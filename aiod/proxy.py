@@ -15,8 +15,10 @@ Progress is also written to the shared events log, so `aiod status` / the TUI /
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import asdict
@@ -25,7 +27,7 @@ import httpx
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import engine, events, state, translate
@@ -320,6 +322,48 @@ def _models_list(model: str) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Built-in chat page (served at / and /chat) + OpenWebUI docker helper
+# --------------------------------------------------------------------------- #
+
+def _load_chat_html() -> str:
+    """Read the packaged chat page via importlib.resources so it works from an
+    installed wheel (where aiod/web/chat.html ships as package data)."""
+    return (importlib.resources.files("aiod") / "web" / "chat.html").read_text(encoding="utf-8")
+
+
+def render_chat_page(manager: Manager) -> str:
+    """Inject the model and (only on a loopback/auth-open bind) the bearer token
+    into the chat page. On a non-loopback / require_auth bind the token is left
+    blank so it is never leaked into a page that could be served off-host."""
+    html = _load_chat_html()
+    token = "" if manager.require_auth else (manager.token or "")
+    model = manager.spin_kwargs.get("model", "model")
+    # json.dumps gives a safe, quoted JS literal so an unusual model/token string
+    # can't break out of the literal (the template no longer wraps these in quotes).
+    return html.replace("__AIOD_TOKEN__", json.dumps(token)).replace(
+        "__AIOD_MODEL__", json.dumps(model)
+    )
+
+
+def webui_docker_cmd(gw_port: int, webui_port: int, token: str) -> list[str]:
+    """Build the `docker run` argv for OpenWebUI pointed at the local gateway's
+    /v1. Pure (no side effects) so the invocation is unit-testable."""
+    cmd = [
+        "docker", "run", "-d",
+        "--name", "aiod-openwebui",
+        "-p", f"{webui_port}:8080",
+        "-e", f"OPENAI_API_BASE_URL=http://host.docker.internal:{gw_port}/v1",
+        "-e", f"OPENAI_API_KEY={token}",
+        "-e", "WEBUI_AUTH=False",
+    ]
+    # On Linux host.docker.internal isn't resolvable by default; wire it explicitly.
+    if sys.platform.startswith("linux"):
+        cmd += ["--add-host=host.docker.internal:host-gateway"]
+    cmd.append("ghcr.io/open-webui/open-webui:main")
+    return cmd
+
+
+# --------------------------------------------------------------------------- #
 # Native Anthropic /v1/messages (opt-in)
 # --------------------------------------------------------------------------- #
 
@@ -531,6 +575,13 @@ def build_app(manager: Manager, *, eager_spin: bool = False) -> Starlette:
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "up", "ready": manager.ready_instance() is not None})
 
+    async def chat_page(request: Request) -> Response:
+        """Serve the self-contained chat page. It streams from the OpenAI
+        passthrough (/v1/chat/completions), so it works without --anthropic and
+        reuses the _warm_then_stream cold-start UX. Token is injected only on a
+        loopback/auth-open bind (see render_chat_page)."""
+        return HTMLResponse(render_chat_page(manager))
+
     async def messages(request: Request) -> Response:
         auth = _check_auth(request, manager.token, manager.require_auth)
         if auth is not None:
@@ -600,6 +651,8 @@ def build_app(manager: Manager, *, eager_spin: bool = False) -> Starlette:
             await app.state.http.aclose()
 
     routes = [
+        Route("/", chat_page, methods=["GET"]),
+        Route("/chat", chat_page, methods=["GET"]),
         Route("/aiod/status", aiod_status, methods=["GET"]),
         Route("/healthz", healthz, methods=["GET"]),
     ]
