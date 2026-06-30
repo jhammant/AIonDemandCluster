@@ -69,6 +69,7 @@ GPU_TIERS: list[GpuTier] = [
     GpuTier("A100 80GB", 80, ["A100 SXM4 80GB", "A100 PCIE 80GB", "A100_SXM4_80GB", "A100"]),
     GpuTier("H100 80GB", 80, ["H100 SXM", "H100 PCIE", "H100_SXM", "H100"]),
     GpuTier("H100 NVL 94GB", 94, ["H100 NVL", "H100_NVL"]),
+    GpuTier("RTX PRO 6000 96GB", 96, ["RTX PRO 6000", "RTX 6000 Pro", "RTX PRO 6000 WS", "RTX6000Pro"]),
     GpuTier("H200 141GB", 141, ["H200"]),
     GpuTier("B200 180GB", 180, ["B200"]),
 ]
@@ -397,10 +398,63 @@ def detect_format(repo: str, hf_token: str | None = None, timeout: float = 20.0)
     return "unknown"
 
 
+# KV-cache size relative to f16, by llama.cpp --cache-type. Quantizing the KV
+# cache (q8_0/q4_0) is the main lever for fitting a longer context on the same box.
+KV_CACHE_FACTOR = {
+    None: 1.0, "f16": 1.0, "bf16": 1.0,
+    "q8_0": 0.5,
+    "q5_0": 0.34, "q5_1": 0.34,
+    "q4_0": 0.27, "q4_1": 0.27,
+}
+
+# llama.cpp needs working VRAM beyond weights+KV (compute graph, fragmentation).
+# This is per-device, so it scales with GPU count, not model size — held back when
+# auto-sizing context so a full-to-the-brim estimate doesn't OOM. Kept modest
+# because the KV estimate itself already over-counts (see size_gguf_model).
+GGUF_PER_GPU_BUFFER_GB = 2.0
+GGUF_MIN_BUFFER_GB = 3.0
+
+
+def context_for_vram(kv_budget_gb: float, kv_quant: str | None = None) -> int:
+    """Inverse of the GGUF KV model: how many tokens a VRAM budget buys.
+
+    `size_gguf_model` models f16 KV as ~8 GB per 8192 tokens; this reverses it,
+    scaled by the same `--cache-type` factor.
+    """
+    factor = KV_CACHE_FACTOR.get(kv_quant, 1.0)
+    if kv_budget_gb <= 0:
+        return 0
+    return int(kv_budget_gb / (8.0 * factor) * 8192)
+
+
+def auto_context_for_offer(
+    total_vram_gb: float,
+    weights_gb: float,
+    kv_quant: str | None = None,
+    *,
+    num_gpus: int = 1,
+    round_to: int = 4096,
+    floor: int = 8192,
+    cap: int = 262144,
+) -> int:
+    """Max context that fits a rented box's spare VRAM after weights + headroom.
+
+    Uses the offer's real VRAM (not the GPU-tier minimum), so a 98 GB card isn't
+    sized as 96. The working-VRAM headroom scales with `num_gpus` (it's a
+    per-device cost), so this isn't biased toward big multi-GPU boxes. Rounded
+    down to `round_to`, clamped to [`floor`, `cap`].
+    """
+    buffer_gb = max(GGUF_MIN_BUFFER_GB, GGUF_PER_GPU_BUFFER_GB * num_gpus)
+    kv_budget = total_vram_gb - weights_gb * 1.02 - buffer_gb
+    ctx = (context_for_vram(kv_budget, kv_quant) // round_to) * round_to
+    return max(floor, min(ctx, cap))
+
+
 def size_gguf_model(
     repo: str,
     hf_token: str | None = None,
     context_len: int | None = None,
+    kv_quant: str | None = None,
 ) -> SizingResult:
     """Size every GGUF quant in a repo by file size and produce a GPU plan each."""
     repo = parse_repo_id(repo)
@@ -410,7 +464,9 @@ def size_gguf_model(
 
     ctx = context_len or 8192
     # llama.cpp KV cache scales with context; rough budget (no per-model config here).
-    kv_gb = max(4.0, (ctx / 8192.0) * 8.0)
+    # A quantized KV cache (--cache-type-k/v) shrinks it by the factor above.
+    kv_factor = KV_CACHE_FACTOR.get(kv_quant, 1.0)
+    kv_gb = max(4.0, (ctx / 8192.0) * 8.0) * kv_factor
 
     plans: list[QuantPlan] = []
     for q in sorted(quants.values(), key=lambda x: x.size_gb):
@@ -451,6 +507,7 @@ def size_any(
     quants: list[str] | None = None,
     context_len: int | None = None,
     concurrency: int = 4,
+    kv_quant: str | None = None,
 ) -> SizingResult:
     """Engine-aware entry point: auto-detect GGUF vs safetensors (or force via
     `engine`) and return the matching SizingResult."""
@@ -459,7 +516,7 @@ def size_any(
     if engine == "auto":
         eng = "llamacpp" if detect_format(repo, hf_token=hf_token) == "gguf" else "vllm"
     if eng == "llamacpp":
-        return size_gguf_model(repo, hf_token=hf_token, context_len=context_len)
+        return size_gguf_model(repo, hf_token=hf_token, context_len=context_len, kv_quant=kv_quant)
     return size_model(
         repo, hf_token=hf_token, quants=quants, context_len=context_len, concurrency=concurrency
     )
