@@ -24,6 +24,7 @@ from rich.table import Table
 from . import (
     branding,
     ccr,
+    engine,
     events,
     model_configs,
     onboard,
@@ -31,6 +32,9 @@ from . import (
     profiles,
     providers,
     state,
+)
+from . import (
+    tune as tune_mod,
 )
 from .bootstrap import CONTAINER_PORT, ServerConfig
 from .config import Settings, persist_vllm_api_key, was_token_minted
@@ -1483,6 +1487,462 @@ def bench(
     console.print(table)
     if concurrency == 1:
         console.print("[dim]Tip: re-run with `-c 8` to measure throughput + cheaper $/1M.[/]")
+
+
+# --------------------------------------------------------------------------- #
+# tune  (sweep + ranked $/1M leaderboard + recommendation)
+# --------------------------------------------------------------------------- #
+
+
+def _parse_ladder(spec: str) -> list[int]:
+    """Parse a concurrency ladder like ``'1,4,8,16'`` -> ``[1, 4, 8, 16]``."""
+    out: list[int] = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if v > 0 and v not in out:
+            out.append(v)
+    return out or [1]
+
+
+def _emergency_teardown(s: Settings) -> None:
+    """Final backstop: destroy whatever box the single state slot still tracks,
+    and assert the slot is empty afterward (warn loudly with the id if not)."""
+    inst = state.load()
+    if inst is not None:
+        try:
+            engine.destroy(s, inst)
+        except Exception:  # noqa: BLE001 - a gone box is fine
+            pass
+    leftover = state.load()
+    if leftover is not None:
+        console.print(
+            f"[red]WARNING:[/] instance [bold]{leftover.instance_id}[/] may still be "
+            f"running — run [bold]aiod teardown[/] to be sure billing stopped."
+        )
+        state.clear()
+
+
+def _fmt(v, unit: str = "", nd: int = 2) -> str:
+    return f"{v:.{nd}f}{unit}" if v is not None else "—"
+
+
+def _render_leaderboard(
+    rows: list, projected: list, rec, *, has_bar: bool
+) -> None:
+    """Ranked $/1M table: measured rows then ~projected rows, recommendation bold."""
+    table = Table(title="Tuning leaderboard — ranked by $/1M output tokens")
+    table.add_column("Opt")
+    table.add_column("Quant")
+    table.add_column("GPU")
+    table.add_column("$/hr", justify="right")
+    table.add_column("Conc", justify="right")
+    table.add_column("TTFT50", justify="right")
+    table.add_column("TTFT95", justify="right")
+    table.add_column("Thrpt", justify="right")
+    table.add_column("$/1M", justify="right")
+    table.add_column("SLA")
+
+    rec_row = rec.row
+    combined = list(rows) + list(projected)
+    combined.sort(key=lambda r: r.cost_per_million if r.cost_per_million is not None else float("inf"))
+    for r in combined:
+        opt = " ".join(r.opt_tokens) or "(none)"
+        is_rec = (rec_row is not None) and (r is rec_row)
+        marker = "~" if r.projected else ""
+        cpm = _fmt(r.cost_per_million, "", 3)
+        cpm_cell = f"[bold]{marker}{cpm}[/]" if (is_rec or not r.projected) else f"{marker}{cpm}"
+        sla = "★" if is_rec else ("modeled" if r.projected else "")
+        opt_cell = f"[bold]{opt}[/]" if is_rec else opt
+        table.add_row(
+            opt_cell,
+            r.quant,
+            r.gpu_desc or "—",
+            _fmt(r.price_per_hr, "", 2),
+            str(r.concurrency),
+            _fmt(r.ttft_p50, "s"),
+            _fmt(r.ttft_p95, "s"),
+            _fmt(r.throughput_tok_s, "", 0),
+            cpm_cell,
+            sla,
+        )
+    console.print(table)
+    if projected:
+        console.print(
+            "[dim]~ = modeled (sizing-projected $/hr, tok/s assumed unchanged) — "
+            "never recommended.[/]"
+        )
+
+
+def _save_tuned_profile(
+    name: str,
+    *,
+    repo: str,
+    provider: str,
+    winner,
+    context: int | None,
+    ttl_h: float | None,
+    idle_m: int | None,
+    force: bool,
+) -> None:
+    import datetime
+
+    if profiles.is_builtin(name) and not force:
+        console.print(
+            f"[red]'{name}' is a built-in profile.[/] Use --force to overwrite, or pick another name."
+        )
+        return
+    if profiles.get(name) is not None and not profiles.is_builtin(name):
+        if not typer.confirm(f"Profile '{name}' already exists — overwrite?"):
+            return
+    opt_tokens = [
+        f"{k}={winner.opt_values[k]}" if k in winner.opt_values else k for k in winner.opt_keys
+    ]
+    date = datetime.date.today().isoformat()
+    p95 = f", p95={winner.ttft_p95:.2f}s" if winner.ttft_p95 is not None else ""
+    p = profiles.Profile(
+        name=name,
+        model=repo,
+        provider=provider,
+        quant=winner.quant,
+        max_price=winner.price_per_hr,
+        context=context,
+        concurrency=winner.concurrency,
+        ttl_hours=ttl_h,
+        idle_minutes=idle_m,
+        optimizations=opt_tokens,
+        description=f"tuned {date}: ${winner.cost_per_million:.3f}/1M{p95} on {winner.gpu_desc}",
+    )
+    profiles.save(p)
+    console.print(
+        f"[green]✓[/] Saved profile [bold]{name}[/] — reproduce with "
+        f"[bold]aiod spin --profile {name}[/]."
+    )
+
+
+@app.command()
+def tune(
+    model: str = typer.Argument(None, help="HuggingFace link / org-name, or a profile name"),
+    provider: str = typer.Option(None, "--provider", help="Backend: vast | runpod"),
+    quant: list[str] = typer.Option(
+        None, "--quant", "-q", help="Quant to sweep (repeatable; >1 engages an opt-combo sweep)"
+    ),
+    context: int = typer.Option(None, "--context", help="Max model length to serve"),
+    opt: list[str] = typer.Option(
+        None, "--opt", help="Base/forced opt KEY or KEY=VAL, always applied (repeatable)"
+    ),
+    sweep_opt: list[str] = typer.Option(
+        None,
+        "--sweep-opt",
+        help="Opt AXIS to sweep: bare KEY = on/off, KEY=v1,v2 = value grid (repeatable)",
+    ),
+    concurrency: str = typer.Option(
+        "1,4,8,16", "--concurrency", "-c", help="Concurrency ladder (c=1 is a TTFT-floor reference)"
+    ),
+    ttft_p95: float = typer.Option(None, "--ttft-p95", help="Latency bar: max TTFT p95 (s)"),
+    ttft_p50: float = typer.Option(None, "--ttft-p50", help="Latency bar: max TTFT p50 (s)"),
+    min_decode: float = typer.Option(None, "--min-decode", help="Latency bar: min decode tok/s"),
+    max_cost: float = typer.Option(
+        None, "--max-cost", help="REQUIRED hard $ ceiling for the whole sweep (or --yes-i-know)"
+    ),
+    max_minutes: int = typer.Option(30, "--max-minutes", help="Wall-clock cap, minutes"),
+    max_price: float = typer.Option(None, "--max-price", help="Per-box $/hr cap"),
+    ttl: float = typer.Option(None, "--ttl", help="Auto-destroy reminder window, hours"),
+    idle: int = typer.Option(None, "--idle", help="Auto-shutdown after N idle minutes"),
+    n: int = typer.Option(8, "--n", help="Requests per benchmark point"),
+    max_tokens: int = typer.Option(256, "--max-tokens", help="Output tokens per request"),
+    prompt: str = typer.Option(None, "--prompt", help="Override the benchmark prompt"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Estimate + plan only, rent nothing ($0)"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+    yes_i_know: bool = typer.Option(
+        False, "--yes-i-know", help="Run with NO --max-cost (uncapped — dangerous)"
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+    save_profile: str = typer.Option(
+        None, "--save-profile", help="Save the measured winner as a profile NAME"
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="With --save-profile, overwrite a built-in profile name"
+    ),
+):
+    """Sweep a box for the cheapest $/1M-token config meeting a latency bar.
+
+    Default: ONE box, ONE model load, concurrency ladder only (cheap). Pass
+    --sweep-opt (or more than one --quant) to engage an opt-combo relaunch sweep.
+    --max-cost is REQUIRED so the cost gate can never be silently absent.
+    """
+    if max_cost is None and not yes_i_know:
+        console.print(
+            "[red]--max-cost is required[/] (a hard $ ceiling for the whole sweep). "
+            "Pass e.g. [bold]--max-cost 0.50[/], or [bold]--yes-i-know[/] to run uncapped."
+        )
+        raise typer.Exit(1)
+
+    prof = profiles.get(model) if model else None
+    repo = prof.model if prof else model
+    if not repo:
+        console.print("[red]Provide a model or a profile name.[/] See [bold]aiod profile list[/].")
+        raise typer.Exit(1)
+
+    s = _settings_or_exit()
+    provider = (provider or (prof.provider if prof else "vast")).lower()
+    _require_provider_key(s, provider)
+
+    quants = list(quant) if quant else ([prof.quant] if prof and prof.quant else ["bf16"])
+    context = context if context is not None else (prof.context if prof else None)
+    ttl_h = (
+        ttl if ttl is not None
+        else (prof.ttl_hours if prof and prof.ttl_hours is not None else s.ttl_hours)
+    )
+    idle_m = idle if idle is not None else (prof.idle_minutes if prof else None)
+    max_p = (
+        max_price if max_price is not None
+        else (prof.max_price if prof and prof.max_price is not None else s.max_price)
+    )
+    base_tokens = _opt_tokens(opt, prof)
+    _validate_opts(base_tokens)
+    ladder = _parse_ladder(concurrency)
+    ladder_max = max(ladder)
+
+    if state.load() is not None:
+        console.print(
+            "[yellow]An instance is already tracked.[/] Run `aiod status` or `aiod teardown` first."
+        )
+        raise typer.Exit(1)
+
+    axes = tune_mod.parse_sweep_axes(sweep_opt)
+    mode_b = bool(axes) or len(quants) > 1
+    combos = tune_mod.build_combos(repo, base_tokens, axes, quants, max_conc=ladder_max)
+    if not combos:
+        console.print("[red]No valid configurations to sweep.[/]")
+        raise typer.Exit(1)
+
+    def _size(repo_arg, **kw):
+        return size_any(repo_arg, hf_token=s.hf_token, **kw)
+
+    projected: dict[str, float] = {}
+    try:
+        client_cm = providers.get_client(provider, s)
+    except providers.ProviderError as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1) from e
+
+    with console.status("Sizing & pricing combos (no rent)..."), client_cm as client:
+        def _price_plan(plan, disk, max_price=None):
+            return client.price_plan(plan, disk, max_price=max_price)
+
+        disk_by_quant: dict[str, float] = {}
+        for q in quants:
+            try:
+                szq = _size(repo, quants=[q], context_len=context, concurrency=ladder_max)
+                pq = szq.plan(q)
+                disk_by_quant[q] = recommend_disk_gb(pq.weights_gb) if pq else 50.0
+            except Exception:  # noqa: BLE001 - projection is best-effort
+                disk_by_quant[q] = 50.0
+        for combo in combos:
+            try:
+                dph = tune_mod.project_combo(
+                    combo,
+                    repo=repo,
+                    context=context,
+                    max_conc=ladder_max,
+                    size_any=_size,
+                    price_plan=_price_plan,
+                    pick_cheapest=_pick_cheapest,
+                    disk=disk_by_quant.get(combo.quant, 50.0),
+                    max_price=max_p,
+                )
+            except Exception:  # noqa: BLE001
+                dph = None
+            if dph is not None:
+                projected[combo.key] = dph
+
+    rentable = [c for c in combos if c.key in projected]
+    rentable.sort(key=lambda c: projected[c.key])
+    if not rentable:
+        console.print(
+            "[red]No combo has a GPU offer that fits within the price cap.[/] "
+            "tune optimizes vLLM (safetensors) models; raise --max-price or try another model."
+        )
+        raise typer.Exit(1)
+
+    contingency = 1.5 if mode_b else 1.0
+    load_guess = 6.0
+    est_cost, est_minutes = tune_mod.estimate(
+        rentable, projected,
+        load_minutes_guess=load_guess, per_point_minutes=1.0, n_points=len(ladder),
+        cold_pull_contingency=contingency,
+    )
+    dphs = [projected[c.key] for c in rentable]
+    mode_desc = "opt-combo sweep" if mode_b else "concurrency ladder only"
+    caps_line = (
+        f"Caps: max-cost ${max_cost:.2f} · max-minutes {max_minutes}"
+        if max_cost is not None
+        else "Caps: [red]UNCAPPED (--yes-i-know)[/] · max-minutes " + str(max_minutes)
+    )
+    console.print(
+        Panel(
+            f"[bold]{repo}[/]\n"
+            f"Combos: {len(rentable)} ({mode_desc})  ·  quants: {', '.join(quants)}\n"
+            f"Ladder: {ladder}  ·  bench n={n}, max_tokens={max_tokens}\n"
+            f"Projected $/hr: ${min(dphs):.2f}–${max(dphs):.2f} per box\n"
+            f"Estimate: [bold]~${est_cost:.2f}[/]  ·  ~{est_minutes:.0f} min  "
+            f"[dim](load time is the least predictable term)[/]\n"
+            f"{caps_line}",
+            title="Tune plan",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    if max_cost is not None and est_cost > max_cost:
+        console.print(
+            f"[red]Estimated ~${est_cost:.2f} exceeds --max-cost ${max_cost:.2f}.[/] "
+            f"Narrow the sweep (fewer combos / shorter ladder) or raise --max-cost."
+        )
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[dim]--dry-run: nothing rented.[/]")
+        raise typer.Exit(0)
+
+    if not yes and not typer.confirm(
+        f"Rent and sweep {len(rentable)} config(s) (est ~${est_cost:.2f})?"
+    ):
+        raise typer.Exit(0)
+
+    def _progress(phase: str, msg: str = "") -> None:
+        console.print(f"[dim]{phase}: {msg}[/]")
+
+    def _launch(combo):
+        return engine.launch(
+            s, model=repo, quant=combo.quant, provider=provider, max_price=max_p,
+            ttl_hours=ttl_h, idle_minutes=idle_m, context=context, concurrency=ladder_max,
+            optimizations=combo.tokens, startup_grace=540, on_event=_progress,
+        )
+
+    def _bench(inst, c):
+        from .bench import DEFAULT_PROMPT, run_benchmark
+
+        return run_benchmark(
+            inst.base_url, inst.repo_id, api_key=inst.api_key, n=n, concurrency=c,
+            max_tokens=max_tokens, prompt=prompt or DEFAULT_PROMPT, price_per_hr=inst.price_per_hr,
+        )
+
+    def _destroy(inst):
+        engine.destroy(s, inst)
+
+    guard = tune_mod.CostGuard(max_cost=max_cost, max_minutes=float(max_minutes))
+    deps = tune_mod.SweepDeps(
+        launch=_launch, bench=_bench, destroy=_destroy,
+        state_load=state.load, state_clear=state.clear, on_event=_progress,
+    )
+    plan = tune_mod.SweepPlan(
+        combos=rentable, ladder=ladder, guard=guard, projected_dph=projected,
+        ttft_p95=ttft_p95, ttft_p50=ttft_p50, min_decode=min_decode, load_minutes_guess=load_guess,
+    )
+
+    import signal
+
+    prev_term = signal.getsignal(signal.SIGTERM)
+
+    def _on_term(_signum, _frame):
+        raise KeyboardInterrupt
+
+    result = None
+    try:
+        try:
+            signal.signal(signal.SIGTERM, _on_term)
+        except (ValueError, OSError):
+            pass
+        result = tune_mod.run_sweep(deps, plan)
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted — tearing down.[/]")
+    finally:
+        try:
+            signal.signal(signal.SIGTERM, prev_term)
+        except (ValueError, OSError):
+            pass
+        _emergency_teardown(s)
+
+    rows = result.rows if result else []
+    has_bar = any(x is not None for x in (ttft_p95, ttft_p50, min_decode))
+    valid, passing = tune_mod.rank(
+        rows, ttft_p95=ttft_p95, ttft_p50=ttft_p50, min_decode=min_decode
+    )
+    rec = tune_mod.recommend(valid, passing, has_bar=has_bar)
+
+    # Modeled rows for rentable combos we never measured (display only, ~marked).
+    measured_keys = {(r.quant, tuple(r.opt_keys), r.concurrency) for r in rows if r.ok > 0}
+    baseline_thrpt = max((r.throughput_tok_s for r in valid if r.throughput_tok_s), default=None)
+    projected_rows = []
+    for combo in rentable:
+        if any(r[0] == combo.quant and r[1] == tuple(combo.opt_keys) for r in measured_keys):
+            continue
+        pr = tune_mod.projected_row(
+            combo, dph=projected.get(combo.key), baseline_throughput=baseline_thrpt,
+            gpu_desc="", concurrency=ladder_max,
+        )
+        if pr is not None:
+            projected_rows.append(pr)
+
+    if json_out:
+        import dataclasses
+        import json as _json
+
+        payload = {
+            "rows": [dataclasses.asdict(r) for r in valid + projected_rows],
+            "recommendation": dataclasses.asdict(rec.row) if rec.row else None,
+            "reason": rec.reason,
+            "fallback": rec.fallback,
+            "stop_reason": result.stop_reason if result else None,
+            "interrupted": result.interrupted if result else False,
+        }
+        console.print_json(_json.dumps(payload))
+    else:
+        if result and result.stop_reason in ("max-cost", "max-minutes"):
+            console.print(
+                f"[yellow]Stopped early: hit --{result.stop_reason}.[/] Showing partial results."
+            )
+        if not valid:
+            console.print("[red]No measured rows.[/] Try raising --max-minutes or --max-cost.")
+        else:
+            _render_leaderboard(valid, projected_rows, rec, has_bar=has_bar)
+            if rec.row is not None:
+                w = rec.row
+                opts_str = " ".join(w.opt_tokens)
+                opt_flag = f" --opt {' --opt '.join(w.opt_tokens)}" if w.opt_tokens else ""
+                console.print(
+                    Panel(
+                        f"{rec.reason}\n"
+                        f"[bold]{w.quant}[/] @ c={w.concurrency} on {w.gpu_desc}  ·  "
+                        f"[bold]${w.cost_per_million:.3f}/1M[/]  ·  "
+                        f"p95={_fmt(w.ttft_p95, 's')}  ·  opts: {opts_str or '(none)'}\n"
+                        f"[dim]Reproduce:[/] aiod spin {repo} --quant {w.quant} -c {w.concurrency}{opt_flag}",
+                        title="★ Recommendation" + ("  (fallback)" if rec.fallback else ""),
+                        border_style="green" if not rec.fallback else "yellow",
+                        expand=False,
+                    )
+                )
+
+    if save_profile:
+        if rec.row is None or (has_bar and rec.fallback):
+            console.print(
+                "[yellow]Not saving a profile:[/] no measured config met the latency bar. "
+                "Relax the bar or raise --n."
+            )
+        else:
+            _save_tuned_profile(
+                save_profile, repo=repo, provider=provider, winner=rec.row,
+                context=context, ttl_h=ttl_h, idle_m=idle_m, force=force,
+            )
 
 
 @app.command()

@@ -30,6 +30,7 @@ def launch(
     tool_parser: str | None = None,  # None -> resolve from model_configs
     extra_args: list[str] | None = None,
     optimizations: list[str] | None = None,  # opt selection tokens (KEY or KEY=VAL)
+    startup_grace: float | None = None,  # None -> today's exact 1200s boot loop
     on_event=None,
 ) -> state.Instance | None:
     """Size → find cheapest fit → rent → wait for boot + model load. Saves state
@@ -111,12 +112,32 @@ def launch(
 
             ep = None
             start = time.time()
+            seen_running = False
             while time.time() - start < 1200:  # slow nodes pull the image slowly
                 vi = client.get_instance(instance_id)
                 ep = client.endpoint_of(vi, CONTAINER_PORT)
-                emit("booting", f"{client.status_of(vi)} ({int(time.time() - start)}s)")
+                st = client.status_of(vi)
+                if "running" in st.lower():
+                    seen_running = True
+                emit("booting", f"{st} ({int(time.time() - start)}s)")
                 if ep:
                     break
+                # Early-abort a bad node (stuck pulling the image) instead of
+                # billing the full 1200s — mirrors cli._wait_for_endpoint. Only
+                # active when a caller passes startup_grace (tune passes 540);
+                # default None preserves today's exact boot loop byte-for-byte.
+                if (
+                    startup_grace is not None
+                    and not seen_running
+                    and (time.time() - start) > startup_grace
+                ):
+                    emit(
+                        "error",
+                        "host never started container (slow/bad node) — aborting early",
+                    )
+                    inst.status = "error"
+                    state.save(inst)
+                    return inst
                 time.sleep(10)
             if not ep:
                 emit("error", "port never mapped (machine may lack free direct ports)")
