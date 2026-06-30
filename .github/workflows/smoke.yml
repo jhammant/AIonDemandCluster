@@ -1,0 +1,49 @@
+name: Smoke (live API probes)
+
+# Weekly check that the vendor endpoints aiod depends on (vast.ai / RunPod /
+# HuggingFace) are still alive and unchanged — the one failure class the mocked
+# unit suite cannot catch (e.g. the v0→v1 vast deprecation that returned HTTP 410).
+#
+# Runs ONLY on a schedule and manual dispatch — never on pull_request — so fork
+# PRs can never reach the API-key secrets.
+#
+# The auth-free probes (RunPod pricing GraphQL, HuggingFace sizing) run with no
+# secrets at all. To also exercise the authenticated endpoints (incl. the vast
+# v1 instances list that broke), add VAST_API_KEY / RUNPOD_API_KEY as repo
+# Actions secrets. Note: these are billable accounts — only do so on a repo you
+# trust, and keep this workflow off pull_request triggers.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # open an alert issue if a depended-on endpoint changed
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Live probes
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: pytest tests/test_live.py -m live -v
+      - name: Open an alert issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "⚠️ Live smoke failed — a vendor API aiod depends on may have changed" \
+            --body "The weekly live smoke check failed. A vast.ai / RunPod / HuggingFace endpoint that aiod depends on returned an unexpected status or response shape — exactly how the v0→v1 (HTTP 410) break would have surfaced early. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
