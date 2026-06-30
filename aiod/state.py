@@ -4,6 +4,7 @@ repo) and never contains secrets beyond the per-launch endpoint token."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from dataclasses import asdict, dataclass
@@ -30,6 +31,7 @@ class Instance:
     status: str = "creating"  # creating | loading | running | error
     provider: str = "vast"  # which backend rented this (vast | runpod | ...)
     idle_minutes: int | None = None  # auto-shutdown threshold, if a watcher is running
+    weights_gb: float | None = None  # model download size, for download-progress %
 
     @property
     def base_url(self) -> str | None:
@@ -50,6 +52,27 @@ class Instance:
         return self.age_hours * self.price_per_hr
 
 
+def download_progress(
+    disk_usage_gb: float | None, weights_gb: float | None, gpu_util: float | None = None
+) -> str | None:
+    """A human 'Download' line from live telemetry, e.g.
+    '135 / 343 GB  (39%) — downloading weights'. Returns None when there's no
+    usable figure. `disk_usage_gb` counts the container image too, so the % runs a
+    little optimistic; GPU activity is what tells us the load phase has started."""
+    if disk_usage_gb is None:
+        return None
+    if not weights_gb:
+        return f"{disk_usage_gb:.0f} GB on disk"
+    pct = min(100.0, disk_usage_gb / weights_gb * 100)
+    if gpu_util and gpu_util > 0:
+        phase = "loading into VRAM"
+    elif pct >= 99:
+        phase = "download complete — loading"
+    else:
+        phase = "downloading weights"
+    return f"{disk_usage_gb:.0f} / {weights_gb:.0f} GB  ({pct:.0f}%) — {phase}"
+
+
 def save(inst: Instance) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(asdict(inst), indent=2))
@@ -60,7 +83,10 @@ def load() -> Instance | None:
         return None
     try:
         data = json.loads(STATE_FILE.read_text())
-        return Instance(**data)
+        # Tolerate fields written by a newer version (drop unknowns) so an older
+        # binary doesn't lose track of a live instance.
+        fields = {f.name for f in dataclasses.fields(Instance)}
+        return Instance(**{k: v for k, v in data.items() if k in fields})
     except (json.JSONDecodeError, TypeError):
         return None
 

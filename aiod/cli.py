@@ -458,6 +458,7 @@ def spin(
             status="creating",
             provider=provider,
             idle_minutes=idle_m,
+            weights_gb=plan.weights_gb,
         )
         state.save(inst)
         console.print(f"[green]✓[/] Instance [bold]{instance_id}[/] created. Waiting for boot...")
@@ -647,17 +648,32 @@ def status():
 
     s = Settings.load()
     live_status = "?"
+    disk_usage = gpu_util = None
     if providers.api_key_for(inst.provider, s):
         try:
             with providers.get_client(inst.provider, s) as client:
                 vi = client.get_instance(inst.instance_id)
                 live_status = client.status_of(vi)
+                disk_usage = vi.get("disk_usage")
+                gpu_util = vi.get("gpu_util")
                 ep = client.endpoint_of(vi, CONTAINER_PORT)
                 if ep and not inst.base_url:
                     inst.host, inst.port = ep
                     state.save(inst)
         except providers.PROVIDER_ERRORS as e:
             live_status = f"error: {e}"
+
+    # Backfill the download size for instances spun before it was tracked, so the
+    # progress % still works. Best-effort: a sizing call hits HF, so only do it
+    # while still loading and cache the result back to state.
+    if inst.weights_gb is None and inst.status != "running" and disk_usage is not None:
+        try:
+            plan = size_any(inst.repo_id, hf_token=s.hf_token).plan(inst.quant)
+            if plan:
+                inst.weights_gb = plan.weights_gb
+                state.save(inst)
+        except Exception:  # noqa: BLE001 - cosmetic; never break `status`
+            pass
 
     over = inst.expires_in_hours < 0
     table = Table(show_header=False)
@@ -674,6 +690,10 @@ def status():
         if over
         else f"{inst.expires_in_hours:.2f} h left",
     )
+    if inst.status != "running":
+        dl = state.download_progress(disk_usage, inst.weights_gb, gpu_util)
+        if dl:
+            table.add_row("Download", dl)
     console.print(table)
     if evs:
         _print_events(evs)

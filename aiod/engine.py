@@ -96,6 +96,7 @@ def launch(
                 status="creating",
                 provider=provider,
                 idle_minutes=idle_minutes,
+                weights_gb=plan.weights_gb,
             )
             state.save(inst)
 

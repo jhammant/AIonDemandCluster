@@ -374,6 +374,7 @@ class AiodTUI(App):
                     status="creating",
                     provider=provider,
                     idle_minutes=idle_m,
+                    weights_gb=(p.weights_gb if (p := self.sizing.plan(quant)) else None),
                 )
                 state.save(inst)
                 self.call_from_thread(self._log, f"[green]✓[/] Instance {instance_id} created.")
