@@ -36,6 +36,19 @@ class VastError(Exception):
     pass
 
 
+def gpu_name_matches(name: str, queries: list[str]) -> bool:
+    """True if `name` matches any --gpu query. A query matches when ALL its
+    whitespace-separated tokens appear (case-insensitively) in the GPU name, so
+    `rtx 6000` matches "RTX PRO 6000 WS" and `a6000` matches "RTX A6000". A single
+    glued token like `rtx6000` only matches a contiguous run, so prefer spaces."""
+    n = name.lower()
+    for q in queries:
+        toks = q.lower().split()
+        if toks and all(t in n for t in toks):
+            return True
+    return False
+
+
 @dataclass
 class Offer:
     id: int
@@ -115,6 +128,7 @@ class VastClient:
         min_compute_cap: int = 800,
         min_inet_mbps: int = 400,
         gpu_names: list[str] | None = None,
+        gpu_match: list[str] | None = None,
         limit: int = 30,
     ) -> list[Offer]:
         query: dict = {
@@ -137,7 +151,9 @@ class VastClient:
             "inet_down": {"gte": min_inet_mbps},
             "type": "ondemand",
             "order": [["dph_total", "asc"]],
-            "limit": limit,
+            # When substring-filtering by GPU name we fetch a wider pool and trim
+            # client-side, since vast's gpu_name filter only does exact matches.
+            "limit": max(limit, 50) if gpu_match else limit,
         }
         if max_price is not None:
             query["dph_total"] = {"lte": float(max_price)}
@@ -145,8 +161,12 @@ class VastClient:
             query["gpu_name"] = {"in": gpu_names}
 
         data = self._post("/api/v0/bundles/", query)
-        offers = data.get("offers", []) or []
-        return [self._parse_offer(o) for o in offers]
+        offers = [self._parse_offer(o) for o in (data.get("offers", []) or [])]
+        if gpu_match:
+            queries = [g for g in gpu_match if g.strip()]
+            offers = [o for o in offers if gpu_name_matches(o.gpu_name, queries)]
+            offers = offers[:limit]
+        return offers
 
     @staticmethod
     def _parse_offer(o: dict) -> Offer:
@@ -271,6 +291,7 @@ class VastClient:
         min_disk_gb: float,
         max_price: float | None = None,
         max_candidates: int = 3,
+        gpu_match: list[str] | None = None,
     ) -> list[PricedOption]:
         """Price the few least-wasteful GPU configs that fit and return them all
         (the caller picks the cheapest by actual price). We sort fitting configs by
@@ -298,6 +319,7 @@ class VastClient:
                 max_price=max_price,
                 min_compute_cap=min_cc,
                 min_inet_mbps=min_inet,
+                gpu_match=gpu_match,
                 limit=10,
             )
             priced.append(PricedOption(option=opt, offer=offers[0] if offers else None))
