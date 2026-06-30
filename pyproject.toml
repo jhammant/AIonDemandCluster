@@ -26,6 +26,14 @@ dev = ["ruff>=0.6", "pytest>=8.0"]
 [project.scripts]
 aiod = "aiod.cli:app"
 
+# Third-party optimization plugins register an Optimization (class or instance)
+# under the 'aiod.optimizations' entry-point group; aiod discovers them
+# fail-soft at runtime (importlib.metadata is stdlib — no new dependency). Core
+# built-in keys are reserved (a later-wins override emits a stderr warning).
+# Declare one in YOUR plugin's pyproject.toml like:
+#   [project.entry-points."aiod.optimizations"]
+#   my-opt = "my_pkg.module:MyOptimization"
+
 [project.urls]
 Homepage = "https://github.com/jhammant/AIonDemandCluster"
 Repository = "https://github.com/jhammant/AIonDemandCluster"

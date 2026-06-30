@@ -34,6 +34,7 @@ class Profile:
     idle_minutes: int | None = None  # auto-shutdown after this idle window
     tool_call_parser: str | None = None  # vLLM --tool-call-parser; None = use model_configs
     extra_vllm_args: list[str] = field(default_factory=list)
+    optimizations: list[str] = field(default_factory=list)  # opt selection tokens (KEY or KEY=VAL)
     description: str = ""
 
     @classmethod
