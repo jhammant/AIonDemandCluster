@@ -25,7 +25,7 @@ import httpx
 
 from .bootstrap import ServerConfig
 from .sizing import QuantPlan
-from .vast import PricedOption
+from .vast import PricedOption, gpu_name_matches
 
 REST = "https://rest.runpod.io/v1"
 GRAPHQL = "https://api.runpod.io/graphql"
@@ -98,15 +98,15 @@ class RunpodClient:
         self, vram_gb: float, gpu_match: list[str] | None = None
     ) -> dict | None:
         """Cheapest SECURE gpu type in the same VRAM class as `vram_gb`."""
-        wanted = ["".join(g.lower().split()) for g in (gpu_match or []) if g.strip()]
+        queries = [g for g in (gpu_match or []) if g.strip()]
         cands: list[tuple[float, dict]] = []
         for g in self._fetch_gpu_types():
             mem, price = g.get("memoryInGb"), g.get("securePrice")
             if not mem or not price or not g.get("secureCloud"):
                 continue
-            if wanted:
-                name = "".join(str(g.get("displayName", g.get("id", ""))).lower().split())
-                if not any(w in name for w in wanted):
+            if queries:
+                name = str(g.get("displayName", g.get("id", "")))
+                if not gpu_name_matches(name, queries):
                     continue
             if vram_gb * 0.95 <= mem <= vram_gb * 1.6:
                 cands.append((price, g))

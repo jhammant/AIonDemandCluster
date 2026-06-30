@@ -234,7 +234,7 @@ def estimate(
     concurrency: int = typer.Option(4, "--concurrency", help="Concurrent sequences for KV estimate"),
     max_price: float = typer.Option(None, "--max-price", help="Cap $/hr in the offer search"),
     gpu: list[str] = typer.Option(
-        None, "--gpu", help="Only consider GPUs whose name contains this (repeatable), e.g. --gpu rtx6000"
+        None, "--gpu", help="Only consider GPUs whose name contains this (repeatable), e.g. --gpu 'rtx 6000'"
     ),
 ):
     """Size a model from its HuggingFace link and show live provider cost ($0)."""
@@ -280,7 +280,8 @@ def estimate(
                     priced = client.price_plan(p, disk, max_price=max_p, gpu_match=gpu or None)
                     best = _pick_cheapest(priced)
                     if best:
-                        fit = f"{best.option.num_gpus}x {best.option.tier.name}"
+                        # Show the real rented card, not the sizing tier proxy.
+                        fit = f"{best.offer.num_gpus}x {best.offer.gpu_name}"
                         hr = f"${best.offer.dph_total:.2f}"
                         four = f"${best.offer.dph_total * 4:.2f}"
                     else:
@@ -310,7 +311,7 @@ def spin(
     ),
     max_price: float = typer.Option(None, "--max-price", help="Hard cap $/hr (default from .env)"),
     gpu: list[str] = typer.Option(
-        None, "--gpu", help="Only rent GPUs whose name contains this (repeatable), e.g. --gpu rtx6000"
+        None, "--gpu", help="Only rent GPUs whose name contains this (repeatable), e.g. --gpu 'rtx 6000'"
     ),
     ttl: float = typer.Option(None, "--ttl", help="Auto-destroy reminder window, hours"),
     idle: int = typer.Option(

@@ -35,6 +35,19 @@ class VastError(Exception):
     pass
 
 
+def gpu_name_matches(name: str, queries: list[str]) -> bool:
+    """True if `name` matches any --gpu query. A query matches when ALL its
+    whitespace-separated tokens appear (case-insensitively) in the GPU name, so
+    `rtx 6000` matches "RTX PRO 6000 WS" and `a6000` matches "RTX A6000". A single
+    glued token like `rtx6000` only matches a contiguous run, so prefer spaces."""
+    n = name.lower()
+    for q in queries:
+        toks = q.lower().split()
+        if toks and all(t in n for t in toks):
+            return True
+    return False
+
+
 @dataclass
 class Offer:
     id: int
@@ -149,11 +162,8 @@ class VastClient:
         data = self._post("/api/v0/bundles/", query)
         offers = [self._parse_offer(o) for o in (data.get("offers", []) or [])]
         if gpu_match:
-            wanted = ["".join(g.lower().split()) for g in gpu_match if g.strip()]
-            offers = [
-                o for o in offers
-                if any(w in "".join(o.gpu_name.lower().split()) for w in wanted)
-            ]
+            queries = [g for g in gpu_match if g.strip()]
+            offers = [o for o in offers if gpu_name_matches(o.gpu_name, queries)]
             offers = offers[:limit]
         return offers
 
