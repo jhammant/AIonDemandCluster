@@ -1,6 +1,6 @@
 [project]
 name = "aiondemandcluster"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI on Demand — spin up a HuggingFace model on vast.ai GPUs and drive it from Claude Code via Claude Code Router."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,6 +36,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["aiod"]
+
+[tool.pytest.ini_options]
+# `live` tests hit real vendor APIs (vast/runpod/HF) and are excluded from the
+# default run so `pytest tests/` stays hermetic. Run them with `pytest -m live`.
+markers = [
+    "live: probes real vendor endpoints; excluded by default (run via `pytest -m live`)",
+]
+addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 110
