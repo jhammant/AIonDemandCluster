@@ -65,7 +65,12 @@ def test_up_spin_kwargs_match_engine_launch_signature(wired):
     result = runner.invoke(app, ["up", "org/repo"])
     assert result.exit_code == 0, result.output
     spin_kwargs = wired["run_gateway"]["spin_kwargs"]
-    launch_params = set(inspect.signature(engine.launch).parameters) - {"s", "on_event"}
+    # `startup_grace` is an additive launch-tuning kwarg (used by `aiod tune` for
+    # early bad-node abort); like `on_event` it's not part of the spin config the
+    # gateway threads through, so it's excluded from this in-sync check.
+    launch_params = set(inspect.signature(engine.launch).parameters) - {
+        "s", "on_event", "startup_grace"
+    }
     assert set(spin_kwargs) == launch_params
 
 

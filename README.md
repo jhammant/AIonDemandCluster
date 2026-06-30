@@ -165,6 +165,46 @@ aiod ccr-config    # re-write the CCR config from the tracked instance
 aiod teardown      # destroy the instance and stop billing  ← run this when done
 ```
 
+### Tune — find the cheapest config that meets a latency bar
+
+`aiod tune` rents a box, sweeps it, and prints a leaderboard ranked by **$/1M
+output tokens**, then recommends the cheapest configuration that meets your
+latency bar. By default it does the cheap thing: **one box, one model load, a
+concurrency ladder only** (vLLM batches concurrency for free). Pass `--sweep-opt`
+(or more than one `--quant`) to engage an opt-combo **relaunch** sweep — each
+optimization combo is a fresh model load, so this costs more and is opt-in.
+
+Cost safety is structural:
+
+- **`--max-cost` is required** (a hard $ ceiling for the whole sweep). The only
+  escape is an explicit `--yes-i-know` to run uncapped.
+- **Guaranteed teardown.** The box is destroyed on success, on error, and on
+  Ctrl-C — including the boot window before the handle is bound (emergency
+  teardown reads the single tracked-instance slot). When `aiod tune` returns, you
+  are not being billed.
+- Hard caps (`--max-cost`, `--max-minutes`) are enforced at every boundary, and a
+  bad node that never starts the container is aborted early instead of billing the
+  full boot timeout.
+
+```bash
+# Default: one box, concurrency ladder, recommend the cheapest point under a p95 bar.
+aiod tune Qwen/Qwen2.5-Coder-7B-Instruct -q fp8 --ttft-p95 1.5 --max-cost 0.50
+
+# Plan + cost estimate only — rents nothing ($0).
+aiod tune coder-7b --max-cost 0.50 --dry-run
+
+# Opt-combo sweep (relaunch per combo): two quants x a prefix-caching toggle.
+aiod tune <model> -q bf16 -q fp8 --sweep-opt prefix-caching --max-cost 2.00
+
+# Save the measured winner as a reusable profile, then reproduce it with spin.
+aiod tune coder-7b -q fp8 --ttft-p95 1.5 --max-cost 0.50 --save-profile coder-fast
+aiod spin --profile coder-fast
+```
+
+The leaderboard marks sizing-**projected** rows with `~` (modeled $/hr, tok/s
+assumed unchanged); projected rows are never the recommendation — the winner is
+always a measured `(config, concurrency)` point.
+
 ### Engines — vLLM and llama.cpp (GGUF)
 
 `aiod` auto-detects the model format: **safetensors / AWQ / fp8 → vLLM**, and
