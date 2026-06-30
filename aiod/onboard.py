@@ -67,7 +67,7 @@ def validate_vast_key(key: str, timeout: float = 15.0) -> tuple[bool, str]:
         return False, "no key provided"
     try:
         r = httpx.get(
-            "https://console.vast.ai/api/v0/instances/",
+            "https://console.vast.ai/api/v1/instances/",
             headers={"Authorization": f"Bearer {key}"},
             timeout=timeout,
         )
@@ -79,8 +79,13 @@ def validate_vast_key(key: str, timeout: float = 15.0) -> tuple[bool, str]:
             return True, f"valid (you have {n} instance(s))"
         except ValueError:
             return True, "valid"
-    if r.status_code == 401:
-        return False, "rejected (401) — wrong or revoked key"
+    # vast.ai signals a bad/revoked key with an auth_error body — and not always a
+    # 401 (a wrong key currently comes back as HTTP 404 with this body).
+    try:
+        if r.json().get("error") == "auth_error":
+            return False, f"rejected (HTTP {r.status_code}) — wrong or revoked key"
+    except ValueError:
+        pass
     return False, f"unexpected HTTP {r.status_code}"
 
 

@@ -11,8 +11,9 @@ Key facts encoded here (verified against the vast-cli source):
                PER-GPU VRAM in MB; needs direct_port_count >= 1 to be reachable.
   * Create:    PUT  /api/v0/asks/{offer_id}/   ; env is a DICT, port maps are
                keys like "-p 8000:8000": "1"; returns {"new_contract": <id>}.
+  * List:      GET  /api/v1/instances/         ; the v0 list was deprecated (410).
   * Endpoint:  GET  /api/v0/instances/{id}/    ; host = public_ipaddr,
-               port = ports["8000/tcp"][0]["HostPort"].
+               port = ports["8000/tcp"][0]["HostPort"]. (single-instance still v0)
   * Destroy:   DELETE /api/v0/instances/{id}/
 """
 
@@ -216,7 +217,8 @@ class VastClient:
         return inst
 
     def list_instances(self) -> list[dict]:
-        data = self._get("/api/v0/instances/")
+        # v0 list was deprecated (410); v1 returns the same {"instances": [...]} shape.
+        data = self._get("/api/v1/instances/")
         inst = data.get("instances", [])
         return inst if isinstance(inst, list) else [inst]
 
