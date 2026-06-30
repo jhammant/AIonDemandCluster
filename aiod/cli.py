@@ -1204,6 +1204,91 @@ def _poll_healthz(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
+def _docker_available() -> bool:
+    try:
+        r = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _ensure_gateway_detached(port: int) -> bool:
+    """Return True once a gateway answers /healthz on ``port`` — reusing a running
+    one if gateway.json points at it, else starting one detached (like `up`)."""
+    from .proxy import read_gateway_file
+
+    gw = read_gateway_file()
+    if gw and gw.get("port") == port and _poll_healthz(port, timeout=2.0):
+        return True
+    if _poll_healthz(port, timeout=2.0):
+        return True
+    console.print(f"[dim]No gateway on :{port} — starting one in the background…[/]")
+    cmd = [sys.executable, "-m", "aiod", "gateway", "--port", str(port), "--no-ccr"]
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    console.print(f"[dim]gateway pid {proc.pid}; polling /healthz…[/]")
+    return _poll_healthz(port)
+
+
+@app.command()
+def chat(
+    port: int = typer.Option(4000, "--port", help="Gateway port to chat against"),
+    webui: bool = typer.Option(False, "--webui", help="Launch OpenWebUI in Docker instead of built-in page"),
+    webui_port: int = typer.Option(3000, "--webui-port", help="Host port for OpenWebUI"),
+    stop: bool = typer.Option(False, "--stop", help="Stop the OpenWebUI container (with --webui)"),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the chat UI in a browser"),
+):
+    """Open a chat UI against the gateway. Default: the built-in no-Docker page
+    served at http://127.0.0.1:<port>/. --webui launches OpenWebUI in Docker."""
+    from .proxy import read_gateway_file, webui_docker_cmd
+
+    if webui:
+        if stop:
+            subprocess.run(["docker", "rm", "-f", "aiod-openwebui"], capture_output=True)
+            console.print("[green]✓[/] OpenWebUI container stopped.")
+            return
+        if not _docker_available():
+            console.print(
+                "[red]Docker is not available.[/] Install/start Docker, or use the built-in "
+                "page: [bold]aiod chat[/] (no Docker)."
+            )
+            raise typer.Exit(1)
+        if not _ensure_gateway_detached(port):
+            console.print("[yellow]Gateway did not report healthy — check [bold]aiod status[/].[/]")
+            raise typer.Exit(1)
+        gw = read_gateway_file()
+        token = gw.get("token", "") if gw else ""
+        # Idempotent: reuse the container by name if it's already there.
+        existing = subprocess.run(
+            ["docker", "ps", "-aq", "-f", "name=^aiod-openwebui$"], capture_output=True, text=True
+        )
+        if existing.returncode == 0 and existing.stdout.strip():
+            subprocess.run(["docker", "start", "aiod-openwebui"], capture_output=True)
+            console.print("[green]✓[/] reused existing OpenWebUI container.")
+        else:
+            res = subprocess.run(webui_docker_cmd(port, webui_port, token), capture_output=True, text=True)
+            if res.returncode != 0:
+                console.print(f"[red]Failed to start OpenWebUI:[/] {res.stderr.strip()}")
+                raise typer.Exit(1)
+            console.print("[green]✓[/] OpenWebUI started.")
+        url = f"http://127.0.0.1:{webui_port}"
+        console.print(f"OpenWebUI: [bold]{url}[/]  (gateway /v1 via host.docker.internal:{port})")
+        if open_browser:
+            _maybe_open(url)
+        return
+
+    # Built-in page.
+    if not _ensure_gateway_detached(port):
+        console.print("[yellow]Gateway did not report healthy — check [bold]aiod status[/].[/]")
+        raise typer.Exit(1)
+    url = f"http://127.0.0.1:{port}/"
+    console.print(f"Chat UI: [bold]{url}[/]")
+    if open_browser:
+        _maybe_open(url)
+
+
 @app.command()
 def bench(
     n: int = typer.Option(8, "--n", help="Number of requests"),
