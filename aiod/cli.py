@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import webbrowser
 
@@ -20,7 +21,7 @@ from rich.table import Table
 
 from . import branding, ccr, events, model_configs, onboard, profiles, providers, state
 from .bootstrap import CONTAINER_PORT, ServerConfig
-from .config import Settings
+from .config import Settings, persist_vllm_api_key, was_token_minted
 from .health import wait_until_ready
 from .sizing import QUANT_LABELS, size_any
 from .vast import PricedOption, recommend_disk_gb
@@ -969,6 +970,90 @@ def proxy(
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Proxy stopped[/] — any running box is left up (aiod status/teardown).")
+
+
+@app.command()
+def gateway(
+    profile: str = typer.Option(None, "--profile", "-p", help="Profile to spin on first request"),
+    model: str = typer.Option(None, "--model", help="Model to spin (if no profile)"),
+    quant: str = typer.Option(None, "--quant", "-q"),
+    provider: str = typer.Option(None, "--provider"),
+    max_price: float = typer.Option(None, "--max-price"),
+    ttl: float = typer.Option(None, "--ttl"),
+    idle: int = typer.Option(20, "--idle", help="Auto-destroy after N idle minutes"),
+    context: int = typer.Option(None, "--context"),
+    port: int = typer.Option(4000, "--port"),
+    bind: str = typer.Option("127.0.0.1", "--bind", help="Address to bind (non-loopback enforces auth)"),
+    write_ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="Point CCR at the gateway"),
+    anthropic: bool = typer.Option(
+        False, "--anthropic/--no-anthropic", help="Mount native Anthropic /v1/messages (opt-in)"
+    ),
+    require_auth: bool = typer.Option(
+        False, "--require-auth/--no-require-auth", help="Enforce the bearer gate even on loopback"
+    ),
+):
+    """Run the always-on local gateway: an auto-spin-up proxy with a /healthz route,
+    a synthesized /v1/models cold path, optional native Anthropic /v1/messages
+    (--anthropic), and a loopback-default-open bearer gate."""
+    s = Settings.load()
+
+    prof = profiles.get(profile) if profile else None
+    if profile and not prof:
+        console.print(f"[red]No profile '{profile}'.[/] See [bold]aiod profile list[/].")
+        raise typer.Exit(1)
+    model = model or (prof.model if prof else None)
+    if not model:
+        console.print("[red]Provide --model or --profile.[/]")
+        raise typer.Exit(1)
+    provider = (provider or (prof.provider if prof else "vast")).lower()
+    _require_provider_key(s, provider)
+
+    if was_token_minted(s) and persist_vllm_api_key(s.vllm_api_key):
+        console.print("[dim]persisted VLLM_API_KEY to ~/.config/aiod/.env[/]")
+
+    spin_kwargs = dict(
+        model=model,
+        quant=quant or (prof.quant if prof else "bf16"),
+        provider=provider,
+        max_price=max_price if max_price is not None else (prof.max_price if prof else None),
+        ttl_hours=ttl if ttl is not None else (prof.ttl_hours if prof else None),
+        idle_minutes=idle,
+        context=context if context is not None else (prof.context if prof else None),
+        concurrency=prof.concurrency if prof else 4,
+        tool_parser=prof.tool_call_parser if prof else None,  # None -> model_configs
+        extra_args=list(prof.extra_vllm_args) if prof else [],
+    )
+
+    base = f"http://127.0.0.1:{port}/v1"
+    if write_ccr:
+        ccr.write_config(base, s.vllm_api_key, model)
+        console.print("[green]✓[/] CCR pointed at the gateway. Run [bold]ccr restart && ccr code[/].")
+
+    env_require = os.getenv("AIOD_GATEWAY_REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+    req_auth = bind != "127.0.0.1" or require_auth or env_require
+    console.print(
+        Panel(
+            f"Listening on [bold]http://{bind}:{port}[/]\n"
+            f"model: {model} ({spin_kwargs['quant']}) · provider: {spin_kwargs['provider']} · "
+            f"idle-shutdown: {idle}m\n"
+            f"anthropic /v1/messages: {'on' if anthropic else 'off'} · "
+            f"auth: {'enforced' if req_auth else 'loopback-open'}\n"
+            f"Routes: /healthz · /aiod/status · /v1/* · GET /v1/models (cold-synthesized)\n"
+            f"Status: [bold]aiod status[/] / the TUI / GET /aiod/status  ·  Ctrl-C stops the gateway.",
+            title="aiod gateway",
+            border_style="green",
+        )
+    )
+    from .proxy import run_gateway
+
+    try:
+        run_gateway(
+            s, spin_kwargs, idle_minutes=idle, host=bind, port=port,
+            enable_anthropic=anthropic, require_auth=req_auth,
+            on_event=lambda phase, msg: console.log(f"[{phase}] {msg}"),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Gateway stopped[/] — any running box is left up (aiod status/teardown).")
 
 
 @app.command()
