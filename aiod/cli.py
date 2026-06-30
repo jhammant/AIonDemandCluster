@@ -41,6 +41,7 @@ from .config import Settings, persist_vllm_api_key, was_token_minted
 from .health import wait_until_ready
 from .hf import parse_repo_id
 from .sizing import QUANT_LABELS, size_any
+from .sizing import QUANT_LABELS, auto_context_for_offer, size_any
 from .vast import PricedOption, recommend_disk_gb
 
 app = typer.Typer(
@@ -400,7 +401,14 @@ def spin(
     idle: int = typer.Option(
         None, "--idle", help="Auto-shutdown after N idle minutes (starts a local watcher)"
     ),
-    context: int = typer.Option(None, "--context", help="Max model length to serve"),
+    context: str = typer.Option(
+        "auto", "--context",
+        help="Max model length: an int, or 'auto' to fill the rented box's spare VRAM",
+    ),
+    kv_quant: str = typer.Option(
+        None, "--kv-quant",
+        help="GGUF only: quantize the KV cache (q8_0/q4_0) to fit a longer context",
+    ),
     concurrency: int = typer.Option(None, "--concurrency", help="Concurrency for KV sizing"),
     opt: list[str] = typer.Option(
         None, "--opt", help="Optimization KEY or KEY=VAL (repeatable); see `aiod opt list`"
@@ -429,7 +437,12 @@ def spin(
     quant = quant or (prof.quant if prof else None)
     provider = (provider or (prof.provider if prof else "vast")).lower()
     _require_provider_key(s, provider)
-    context = context if context is not None else (prof.context if prof else None)
+    # Context: explicit int wins; 'auto' (the default) defers to a pinned profile
+    # value, else fills the box's spare VRAM once the offer is known (GGUF only).
+    if context == "auto" and prof and prof.context is not None:
+        context = str(prof.context)
+    auto_context = context == "auto"
+    context = None if auto_context else int(context)
     concurrency = concurrency if concurrency is not None else (prof.concurrency if prof else 4)
     max_p = (
         max_price if max_price is not None
@@ -462,8 +475,22 @@ def spin(
             model, engine=engine, hf_token=s.hf_token,
             quants=[quant] if quant else None, context_len=context, concurrency=concurrency,
             opts=opt_keys, opt_values=opt_values,
+            kv_quant=kv_quant,
         )
     eng = sizing.engine
+    if kv_quant:
+        # --cache-type-k/v are llama.cpp flags, and extra_args is appended to the
+        # vLLM argv too — passing them to vLLM means a server that won't start.
+        # Sizing already ignores kv_quant off the GGUF path, so say so and stop
+        # rather than quietly serving something the user didn't ask for.
+        if eng != "llamacpp":
+            console.print(
+                "[red]--kv-quant only applies to GGUF models served by llama.cpp[/] "
+                f"(this model is served by {eng}). Drop the flag, or pick a GGUF quant."
+            )
+            raise typer.Exit(1)
+        # Quantize the llama.cpp KV cache (sizing already accounts for the saving).
+        extra_args += ["--cache-type-k", kv_quant, "--cache-type-v", kv_quant]
     m = sizing.model
 
     if quant is None:
@@ -494,6 +521,19 @@ def spin(
             raise typer.Exit(1)
 
         offer = best.offer
+
+        # Auto-context: now that a box is chosen, hand its spare VRAM to the context
+        # window. GGUF only — vLLM keeps deferring to the model's own max (None).
+        ctx_note = ""
+        if auto_context and eng == "llamacpp":
+            context = auto_context_for_offer(
+                offer.total_vram_gb, plan.weights_gb, kv_quant,
+                num_gpus=best.option.num_gpus,
+            )
+            ctx_note = f"\nContext: [bold]{context:,}[/] tokens (auto — fills spare VRAM)"
+        elif not auto_context:
+            ctx_note = f"\nContext: {context:,} tokens"
+
         console.print(
             Panel(
                 f"[bold]{m.repo_id}[/]  ·  {quant} ({QUANT_LABELS.get(quant, quant)})\n"
@@ -502,7 +542,8 @@ def spin(
                 f"Disk:  {disk} GB\n"
                 f"Price: [bold]${offer.dph_total:.2f}/hr[/]  (~${offer.dph_total * ttl_h:.2f} "
                 f"over a {ttl_h:g}h session)\n"
-                f"VRAM:  need ~{plan.required_vram_gb:.0f} GB / have {offer.total_vram_gb:.0f} GB",
+                f"VRAM:  need ~{plan.required_vram_gb:.0f} GB / have {offer.total_vram_gb:.0f} GB"
+                f"{ctx_note}",
                 title="Launch plan",
                 border_style="cyan",
                 expand=False,
