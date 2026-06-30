@@ -21,7 +21,17 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from . import branding, ccr, events, model_configs, onboard, profiles, providers, state
+from . import (
+    branding,
+    ccr,
+    events,
+    model_configs,
+    onboard,
+    optimizations,
+    profiles,
+    providers,
+    state,
+)
 from .bootstrap import CONTAINER_PORT, ServerConfig
 from .config import Settings, persist_vllm_api_key, was_token_minted
 from .health import wait_until_ready
@@ -39,7 +49,45 @@ console = Console()
 profile_app = typer.Typer(no_args_is_help=True, help="Manage spin-up profiles (named presets).")
 app.add_typer(profile_app, name="profile")
 
+opt_app = typer.Typer(no_args_is_help=True, help="Inspect serving/sizing optimizations.")
+app.add_typer(opt_app, name="opt")
+
 ONLINE_QUANTS = {"bf16", "fp16", "fp8"}  # work on any repo; int4 needs a pre-quantized checkpoint
+
+
+# --------------------------------------------------------------------------- #
+# Optimization selection helpers
+# --------------------------------------------------------------------------- #
+
+def _opt_tokens(opt_flags: list[str] | None, prof) -> list[str]:
+    """Resolution: --opt  >  profile.optimizations  >  default_selection()."""
+    if opt_flags:
+        return list(opt_flags)
+    if prof and getattr(prof, "optimizations", None):
+        return list(prof.optimizations)
+    return optimizations.default_selection()
+
+
+def _validate_opts(raw: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Parse + validate opt tokens against the registry; exit listing valid keys
+    on an unknown key (mirrors the quant-error convention)."""
+    keys, values = optimizations.parse_selection(raw)
+    reg = optimizations.registry()
+    for k in keys:
+        if k not in reg:
+            valid = ", ".join(sorted(reg.keys()))
+            console.print(f"[red]Unknown optimization '{k}'.[/] Valid keys: {valid}")
+            raise typer.Exit(1)
+    try:
+        # Surface conflicts/value-misuse early (engine-agnostic check).
+        optimizations.resolve(
+            keys, values,
+            optimizations.OptContext(engine="vllm", quant="bf16", repo_id="org/model"),
+        )
+    except ValueError as e:
+        console.print(f"[red]Invalid optimization selection:[/] {e}")
+        raise typer.Exit(1) from e
+    return keys, values
 
 
 # --------------------------------------------------------------------------- #
@@ -240,15 +288,28 @@ def estimate(
     gpu: list[str] = typer.Option(
         None, "--gpu", help="Only consider GPUs whose name contains this (repeatable), e.g. --gpu 'rtx 6000'"
     ),
+    opt: list[str] = typer.Option(
+        None, "--opt", help="Optimization KEY or KEY=VAL (repeatable); see `aiod opt list`"
+    ),
 ):
     """Size a model from its HuggingFace link and show live provider cost ($0)."""
     provider = provider.lower()
     s = Settings.load()
     _require_provider_key(s, provider)
+    opt_keys, opt_values = _validate_opts(_opt_tokens(opt, None))
     with console.status("Fetching model metadata from HuggingFace..."):
         sizing = size_any(
             model, engine=engine, hf_token=s.hf_token, quants=quant,
             context_len=context, concurrency=concurrency,
+            opts=opt_keys, opt_values=opt_values,
+        )
+        # Baseline (no opts) so we can show the payoff side-by-side.
+        baseline = (
+            size_any(
+                model, engine=engine, hf_token=s.hf_token, quants=quant,
+                context_len=context, concurrency=concurrency,
+            )
+            if opt_keys else sizing
         )
     m = sizing.model
 
@@ -275,6 +336,10 @@ def estimate(
     table.add_column("$/hr", justify="right")
     table.add_column("$/4h", justify="right")
 
+    def _tier_of(plan) -> str:
+        cf = plan.cheapest_fit if plan else None
+        return f"{cf.num_gpus}x {cf.tier.name}" if cf else "—"
+
     max_p = max_price if max_price is not None else s.max_price
     try:
         with providers.get_client(provider, s) as client:
@@ -290,11 +355,21 @@ def estimate(
                         four = f"${best.offer.dph_total * 4:.2f}"
                     else:
                         fit, hr, four = "[red]no offer found[/]", "—", "—"
-                    table.add_row(f"{p.quant}", f"{p.required_vram_gb:.0f} GB", fit, hr, four)
+                    if opt_keys:
+                        b = baseline.plan(p.quant)
+                        vram = f"{b.required_vram_gb:.0f}→{p.required_vram_gb:.0f} GB"
+                        bt, pt = _tier_of(b), _tier_of(p)
+                        if bt != pt:
+                            fit = f"{bt} → {pt}"
+                    else:
+                        vram = f"{p.required_vram_gb:.0f} GB"
+                    table.add_row(f"{p.quant}", vram, fit, hr, four)
     except providers.PROVIDER_ERRORS as e:
         console.print(f"[red]{provider} error:[/] {e}")
         raise typer.Exit(1) from e
     console.print(table)
+    if opt_keys:
+        console.print(f"[dim]Opts: {' '.join(_opt_tokens(opt, None))} (baseline → optimized)[/]")
     console.print(
         "[dim]Tip: int4 (awq/gptq) needs a pre-quantized repo; fp8 works online on any model.[/]"
     )
@@ -323,6 +398,9 @@ def spin(
     ),
     context: int = typer.Option(None, "--context", help="Max model length to serve"),
     concurrency: int = typer.Option(None, "--concurrency", help="Concurrency for KV sizing"),
+    opt: list[str] = typer.Option(
+        None, "--opt", help="Optimization KEY or KEY=VAL (repeatable); see `aiod opt list`"
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
     no_ccr: bool = typer.Option(False, "--no-ccr", help="Don't touch the CCR config"),
     dry_run: bool = typer.Option(
@@ -361,6 +439,7 @@ def spin(
     mc = model_configs.resolve(model)
     tool_parser = (prof.tool_call_parser if prof and prof.tool_call_parser else None) or mc.tool_call_parser
     extra_args = (list(prof.extra_vllm_args) if prof else []) + mc.vllm_serving_args()
+    opt_keys, opt_values = _validate_opts(_opt_tokens(opt, prof))
 
     if state.load() is not None:
         console.print(
@@ -378,6 +457,7 @@ def spin(
         sizing = size_any(
             model, engine=engine, hf_token=s.hf_token,
             quants=[quant] if quant else None, context_len=context, concurrency=concurrency,
+            opts=opt_keys, opt_values=opt_values,
         )
     eng = sizing.engine
     m = sizing.model
@@ -434,6 +514,8 @@ def spin(
             max_model_len=context,
             tool_call_parser=tool_parser,
             extra_args=extra_args,
+            optimizations=opt_keys,
+            opt_values=opt_values,
             hf_token=s.hf_token,
             gguf_quant=quant if eng == "llamacpp" else None,
         )
@@ -907,6 +989,54 @@ def profile_path():
     console.print(str(profiles.PROFILE_FILE))
 
 
+# --------------------------------------------------------------------------- #
+# opt subcommands
+# --------------------------------------------------------------------------- #
+
+@opt_app.command("list")
+def opt_list(
+    model: str = typer.Argument(None, help="Optional HF model to test applicability/sizing against"),
+):
+    """List available optimizations (and, with MODEL, how they apply to it)."""
+    spec = None
+    if model:
+        s = Settings.load()
+        try:
+            from .sizing import fetch_model_spec
+            with console.status(f"Fetching {model} metadata..."):
+                spec = fetch_model_spec(model, hf_token=s.hf_token)
+        except Exception as e:  # noqa: BLE001 - listing is informational
+            console.print(f"[yellow]![/] Couldn't fetch {model}: {e} — showing engine support only.")
+            spec = None
+
+    table = Table(title="Optimizations")
+    for col in ("Key", "Engines", "Default", "Applies", "Sizing", "Summary", "Trade-off"):
+        table.add_column(col)
+    for o in optimizations.enumerate_all():
+        ctx = optimizations.OptContext(
+            engine="vllm", quant="bf16", repo_id=model or "org/model", spec=spec,
+        )
+        applies = "[green]yes[/]" if o.applies(ctx) else "[dim]no[/]"
+        knobs = o.sizing(optimizations.SizingKnobs(), ctx)
+        parts = []
+        if knobs.kv_scale != 1.0:
+            parts.append(f"kv×{knobs.kv_scale:g}")
+        if knobs.weight_scale != 1.0:
+            parts.append(f"wt×{knobs.weight_scale:g}")
+        sizing_s = ", ".join(parts) if parts else "—"
+        table.add_row(
+            o.key,
+            ",".join(o.engines),
+            "on" if o.default_on else "off",
+            applies,
+            sizing_s,
+            o.summary,
+            o.tradeoff,
+        )
+    console.print(table)
+    console.print("[dim]Use one: [bold]aiod spin <model> --opt kv-cache-fp8 --opt max-num-seqs=256[/][/]")
+
+
 @app.command()
 def proxy(
     profile: str = typer.Option(None, "--profile", "-p", help="Profile to spin on first request"),
@@ -946,6 +1076,7 @@ def proxy(
         concurrency=prof.concurrency if prof else 4,
         tool_parser=prof.tool_call_parser if prof else None,  # None -> model_configs
         extra_args=list(prof.extra_vllm_args) if prof else [],
+        optimizations=list(prof.optimizations) if prof else [],
     )
 
     base = f"http://127.0.0.1:{port}/v1"
@@ -985,6 +1116,9 @@ def gateway(
     ttl: float = typer.Option(None, "--ttl"),
     idle: int = typer.Option(20, "--idle", help="Auto-destroy after N idle minutes"),
     context: int = typer.Option(None, "--context"),
+    opt: list[str] = typer.Option(
+        None, "--opt", help="Optimization KEY or KEY=VAL (repeatable); see `aiod opt list`"
+    ),
     port: int = typer.Option(4000, "--port"),
     bind: str = typer.Option("127.0.0.1", "--bind", help="Address to bind (non-loopback enforces auth)"),
     write_ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="Point CCR at the gateway"),
@@ -1017,6 +1151,8 @@ def gateway(
     if was_token_minted(s) and persist_vllm_api_key(s.vllm_api_key):
         console.print("[dim]persisted VLLM_API_KEY to ~/.config/aiod/.env[/]")
 
+    opt_tokens = _opt_tokens(opt, prof)
+    _validate_opts(opt_tokens)
     spin_kwargs = dict(
         model=model,
         quant=quant or (prof.quant if prof else "bf16"),
@@ -1028,6 +1164,7 @@ def gateway(
         concurrency=prof.concurrency if prof else 4,
         tool_parser=prof.tool_call_parser if prof else None,  # None -> model_configs
         extra_args=list(prof.extra_vllm_args) if prof else [],
+        optimizations=opt_tokens,
     )
 
     base = f"http://127.0.0.1:{port}/v1"
@@ -1074,6 +1211,9 @@ def up(
     ttl: float = typer.Option(None, "--ttl"),
     idle: int = typer.Option(20, "--idle", help="Auto-destroy after N idle minutes"),
     context: int = typer.Option(None, "--context"),
+    opt: list[str] = typer.Option(
+        None, "--opt", help="Optimization KEY or KEY=VAL (repeatable); see `aiod opt list`"
+    ),
     port: int = typer.Option(4000, "--port"),
     write_ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="Point CCR at the local gateway"),
     anthropic: bool = typer.Option(
@@ -1107,6 +1247,8 @@ def up(
     if was_token_minted(s) and persist_vllm_api_key(s.vllm_api_key):
         console.print("[dim]persisted VLLM_API_KEY to ~/.config/aiod/.env[/]")
 
+    opt_tokens = _opt_tokens(opt, prof)
+    _validate_opts(opt_tokens)
     spin_kwargs = dict(
         model=model,
         quant=quant or (prof.quant if prof else "bf16"),
@@ -1118,6 +1260,7 @@ def up(
         concurrency=prof.concurrency if prof else 4,
         tool_parser=prof.tool_call_parser if prof else None,  # None -> model_configs
         extra_args=list(prof.extra_vllm_args) if prof else [],
+        optimizations=opt_tokens,
     )
 
     # Wire CCR at the STABLE local gateway URL — never the rotating box — so CCR
@@ -1163,6 +1306,10 @@ def up(
             cmd += ["--ttl", str(spin_kwargs["ttl_hours"])]
         if spin_kwargs["context"] is not None:
             cmd += ["--context", str(spin_kwargs["context"])]
+        # Forward each opt token as a real --opt flag (a detached gateway would
+        # otherwise silently drop opts not carried by the profile).
+        for tok in spin_kwargs["optimizations"]:
+            cmd += ["--opt", tok]
         if anthropic:
             cmd += ["--anthropic"]
         if not no_spin:

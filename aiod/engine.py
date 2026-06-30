@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 
 from . import events, model_configs, providers, state
+from . import optimizations as opts_mod
 from .bootstrap import CONTAINER_PORT, ServerConfig
 from .config import Settings
 from .health import wait_until_ready
@@ -28,6 +29,7 @@ def launch(
     concurrency: int = 4,
     tool_parser: str | None = None,  # None -> resolve from model_configs
     extra_args: list[str] | None = None,
+    optimizations: list[str] | None = None,  # opt selection tokens (KEY or KEY=VAL)
     on_event=None,
 ) -> state.Instance | None:
     """Size → find cheapest fit → rent → wait for boot + model load. Saves state
@@ -41,11 +43,16 @@ def launch(
     max_p = max_price if max_price is not None else s.max_price
     ttl_h = ttl_hours if ttl_hours is not None else s.ttl_hours
 
+    # Parse opts ONCE; the SAME resolved keys+values feed sizing (cheaper tier)
+    # and the ServerConfig argv below — so the two paths can't disagree.
+    opt_keys, opt_vals = opts_mod.parse_selection(optimizations or [])
+
     events.clear()
     emit("sizing", model)
     try:
         sizing = size_model(
-            model, hf_token=s.hf_token, quants=[quant], context_len=context, concurrency=concurrency
+            model, hf_token=s.hf_token, quants=[quant], context_len=context,
+            concurrency=concurrency, opts=opt_keys, opt_values=opt_vals,
         )
     except Exception as e:  # noqa: BLE001 - background task; report and bail
         emit("error", f"sizing failed: {e}")
@@ -78,6 +85,8 @@ def launch(
                 max_model_len=context,
                 tool_call_parser=tool_parser or mc.tool_call_parser,
                 extra_args=(extra_args or []) + mc.vllm_serving_args(),
+                optimizations=opt_keys,
+                opt_values=opt_vals,
                 hf_token=s.hf_token,
             )
             emit("renting", f"{offer.desc} @ ${offer.dph_total:.2f}/hr")

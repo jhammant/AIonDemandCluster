@@ -20,6 +20,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import optimizations
+from .optimizations import SizingKnobs  # noqa: F401 - re-exported for type hints
+
 HF_API = "https://huggingface.co/api/models"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/config.json"
 
@@ -122,6 +125,10 @@ class QuantPlan:
     kv_gb: float
     required_vram_gb: float
     options: list[GpuOption]
+    # Hardware floor for the offer search (Ampere by default; opts can raise it).
+    min_compute_cap: int = 800
+    # Resolved optimization keys folded into this plan's sizing.
+    applied_opts: list[str] = field(default_factory=list)
 
     @property
     def cheapest_fit(self) -> GpuOption | None:
@@ -242,10 +249,19 @@ def estimate_vram(
     spec: ModelSpec,
     quant: str,
     context_tokens: int,
+    knobs: SizingKnobs | None = None,
 ) -> tuple[float, float, float]:
-    """Return (weights_gb, kv_gb, required_total_gb) for a quant scheme."""
+    """Return (weights_gb, kv_gb, required_total_gb) for a quant scheme.
+
+    ``knobs`` (from the optimization layer) multiplicatively scales the weights
+    and KV result BEFORE the required sum, so a smaller/larger required flows
+    into plan_gpus and auto-selects a different tier. ``knobs=None`` =>
+    float-identical to the un-optimized estimate.
+    """
     bytes_per_param = QUANT_BYTES[quant]
     weights_gb = spec.params * bytes_per_param / 1e9
+    if knobs is not None:
+        weights_gb *= knobs.weight_scale
 
     kv_per_tok = _kv_bytes_per_token(spec)
     if kv_per_tok is not None:
@@ -253,6 +269,9 @@ def estimate_vram(
     else:
         # No config shape available — assume KV ~ 15% of weights as a rough floor.
         kv_gb = weights_gb * 0.15
+    if knobs is not None:
+        # Scale the OUTPUT kv_gb so kv-cache-fp8 also halves the fallback branch.
+        kv_gb *= knobs.kv_scale
 
     required = weights_gb * OVERHEAD_MULT + kv_gb + FIXED_GB_PER_GPU
     return weights_gb, kv_gb, required
@@ -296,8 +315,16 @@ def size_model(
     context_len: int | None = None,
     concurrency: int = 4,
     max_context_for_estimate: int = 32768,
+    opts: list[str] | None = None,
+    opt_values: dict[str, str] | None = None,
 ) -> SizingResult:
-    """End-to-end: HF link -> sizing across quant options."""
+    """End-to-end: HF link -> sizing across quant options.
+
+    ``opts``/``opt_values`` are resolved per quant (via the optimization layer),
+    scaling the VRAM estimate and stamping the compute-cap floor + applied keys
+    onto each QuantPlan — in ONE place, so size_any and engine.launch can never
+    ship the sizing shrink without its hardware gate (no split-brain).
+    """
     spec = fetch_model_spec(model, hf_token=hf_token)
 
     ctx = context_len or spec.max_context or 8192
@@ -307,7 +334,19 @@ def size_model(
     quants = quants or ["bf16", "fp8", "awq-int4"]
     plans: list[QuantPlan] = []
     for q in quants:
-        weights_gb, kv_gb, required = estimate_vram(spec, q, context_tokens)
+        knobs = None
+        min_cc = 800
+        applied: list[str] = []
+        if opts:
+            octx = optimizations.OptContext(
+                engine="vllm", quant=q, repo_id=spec.repo_id,
+                concurrency=max(1, concurrency), spec=spec,
+            )
+            resolved = optimizations.resolve(opts, opt_values or {}, octx)
+            knobs = resolved.knobs
+            min_cc = max(800, resolved.requirements.min_compute_cap)
+            applied = resolved.keys
+        weights_gb, kv_gb, required = estimate_vram(spec, q, context_tokens, knobs=knobs)
         plans.append(
             QuantPlan(
                 quant=q,
@@ -316,6 +355,8 @@ def size_model(
                 kv_gb=kv_gb,
                 required_vram_gb=required,
                 options=plan_gpus(required),
+                min_compute_cap=min_cc,
+                applied_opts=applied,
             )
         )
 
@@ -451,6 +492,8 @@ def size_any(
     quants: list[str] | None = None,
     context_len: int | None = None,
     concurrency: int = 4,
+    opts: list[str] | None = None,
+    opt_values: dict[str, str] | None = None,
 ) -> SizingResult:
     """Engine-aware entry point: auto-detect GGUF vs safetensors (or force via
     `engine`) and return the matching SizingResult."""
@@ -461,5 +504,6 @@ def size_any(
     if eng == "llamacpp":
         return size_gguf_model(repo, hf_token=hf_token, context_len=context_len)
     return size_model(
-        repo, hf_token=hf_token, quants=quants, context_len=context_len, concurrency=concurrency
+        repo, hf_token=hf_token, quants=quants, context_len=context_len,
+        concurrency=concurrency, opts=opts, opt_values=opt_values,
     )

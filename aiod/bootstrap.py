@@ -44,6 +44,8 @@ class ServerConfig:
     gpu_memory_utilization: float = 0.92
     tool_call_parser: str = "hermes"
     extra_args: list[str] = field(default_factory=list)
+    optimizations: list[str] = field(default_factory=list)  # resolved opt keys
+    opt_values: dict[str, str] = field(default_factory=dict)  # {key: value} for value-bearing opts
     hf_token: str | None = None
     gguf_quant: str | None = None  # llamacpp: the GGUF quant tag, e.g. "UD-IQ1_M"
 
@@ -74,6 +76,14 @@ class ServerConfig:
             args += ["--quantization", flag]
         if self.max_model_len:
             args += ["--max-model-len", str(self.max_model_len)]
+        # Optimization flags go JUST BEFORE extra_args so extra_args still wins.
+        # Empty list => byte-identical argv to before.
+        if self.optimizations:
+            from . import optimizations
+            ctx = optimizations.OptContext(
+                engine=self.engine, quant=self.quant, repo_id=self.repo_id
+            )
+            args += optimizations.vllm_flags(self.optimizations, self.opt_values, ctx)
         args += self.extra_args
         return args
 
@@ -90,6 +100,12 @@ class ServerConfig:
             "--jinja",              # enable OpenAI tool/function calling
             "-c", str(self.max_model_len or 32768),
         ]
+        if self.optimizations:
+            from . import optimizations
+            ctx = optimizations.OptContext(
+                engine=self.engine, quant=self.quant, repo_id=self.repo_id
+            )
+            args += optimizations.llamacpp_flags(self.optimizations, self.opt_values, ctx)
         args += self.extra_args
         return args
 

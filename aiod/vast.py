@@ -300,7 +300,9 @@ class VastClient:
         Bounded to `max_candidates` searches to stay under vast.ai's rate limit
         (the client also throttles + backs off on 429)."""
         # fp8 is only reliable on Ada+ (cc 8.9); on Ampere it yields garbage output.
-        min_cc = 890 if plan.quant == "fp8" else 800
+        # plan.min_compute_cap (default 800) lifts the floor for opts like
+        # kv-cache-fp8 that also require Ada+; max() keeps every existing path a no-op.
+        min_cc = max(890 if plan.quant == "fp8" else 800, plan.min_compute_cap)
         # Scale the network-speed floor to the download size so big GGUF models don't
         # land on a slow node (343GB @ 200Mbps = ~3.8h of idle GPU billing).
         if plan.weights_gb > 150:
