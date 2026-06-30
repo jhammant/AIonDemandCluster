@@ -493,7 +493,7 @@ async def _warm_then_messages(manager: Manager, client: httpx.AsyncClient, body_
         await up.aclose()
 
 
-def build_app(manager: Manager) -> Starlette:
+def build_app(manager: Manager, *, eager_spin: bool = False) -> Starlette:
     async def proxy_v1(request: Request) -> Response:
         auth = _check_auth(request, manager.token, manager.require_auth)
         if auth is not None:
@@ -588,6 +588,11 @@ def build_app(manager: Manager) -> Starlette:
     async def lifespan(app: Starlette):
         app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(None))
         idle_task = asyncio.create_task(manager.idle_monitor())
+        # `aiod up` warms the box before the first request arrives so the cold
+        # start overlaps with the user reading the next-steps panel. Default off
+        # (gateway/proxy) so there is no behavior change.
+        if eager_spin:
+            asyncio.create_task(manager.ensure())
         try:
             yield
         finally:
@@ -617,10 +622,14 @@ def run_gateway(
     port: int = 4000,
     enable_anthropic: bool = False,
     require_auth: bool = False,
+    eager_spin: bool = False,
     on_event=None,
 ) -> None:
     """Run the always-on local gateway. The canonical entrypoint; `aiod proxy`
-    delegates here with the Anthropic endpoint + auth disabled for back-compat."""
+    delegates here with the Anthropic endpoint + auth disabled for back-compat.
+
+    When ``eager_spin`` is True the manager kicks one ``ensure()`` at startup so
+    the box begins warming before the first request (used by ``aiod up``)."""
     import uvicorn
 
     manager = Manager(
@@ -629,7 +638,10 @@ def run_gateway(
     )
     write_gateway_file(port, manager.token)
     try:
-        uvicorn.run(build_app(manager), host=host, port=port, log_level="warning")
+        uvicorn.run(
+            build_app(manager, eager_spin=eager_spin),
+            host=host, port=port, log_level="warning",
+        )
     finally:
         clear_gateway_file()
 

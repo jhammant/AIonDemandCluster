@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 import webbrowser
 
@@ -23,6 +25,7 @@ from . import branding, ccr, events, model_configs, onboard, profiles, providers
 from .bootstrap import CONTAINER_PORT, ServerConfig
 from .config import Settings, persist_vllm_api_key, was_token_minted
 from .health import wait_until_ready
+from .hf import parse_repo_id
 from .sizing import QUANT_LABELS, size_any
 from .vast import PricedOption, recommend_disk_gb
 
@@ -991,6 +994,9 @@ def gateway(
     require_auth: bool = typer.Option(
         False, "--require-auth/--no-require-auth", help="Enforce the bearer gate even on loopback"
     ),
+    eager_spin: bool = typer.Option(
+        False, "--eager-spin/--no-eager-spin", help="Warm the box at startup, not on first request"
+    ),
 ):
     """Run the always-on local gateway: an auto-spin-up proxy with a /healthz route,
     a synthesized /v1/models cold path, optional native Anthropic /v1/messages
@@ -1049,11 +1055,153 @@ def gateway(
     try:
         run_gateway(
             s, spin_kwargs, idle_minutes=idle, host=bind, port=port,
-            enable_anthropic=anthropic, require_auth=req_auth,
+            enable_anthropic=anthropic, require_auth=req_auth, eager_spin=eager_spin,
             on_event=lambda phase, msg: console.log(f"[{phase}] {msg}"),
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped[/] — any running box is left up (aiod status/teardown).")
+
+
+@app.command()
+def up(
+    link: str = typer.Argument(
+        ..., help="HuggingFace URL or repo id (org/repo), or a known profile name"
+    ),
+    profile: str = typer.Option(None, "--profile", "-p", help="Use a named profile's settings"),
+    quant: str = typer.Option(None, "--quant", "-q"),
+    provider: str = typer.Option(None, "--provider"),
+    max_price: float = typer.Option(None, "--max-price"),
+    ttl: float = typer.Option(None, "--ttl"),
+    idle: int = typer.Option(20, "--idle", help="Auto-destroy after N idle minutes"),
+    context: int = typer.Option(None, "--context"),
+    port: int = typer.Option(4000, "--port"),
+    write_ccr: bool = typer.Option(True, "--ccr/--no-ccr", help="Point CCR at the local gateway"),
+    anthropic: bool = typer.Option(
+        False, "--anthropic/--no-anthropic", help="Mount native Anthropic /v1/messages (opt-in)"
+    ),
+    detach: bool = typer.Option(False, "--detach", help="Run the gateway in the background"),
+    no_spin: bool = typer.Option(False, "--no-spin", help="Don't eagerly warm the box at startup"),
+):
+    """One command: resolve a model, point CCR at the stable local gateway, start
+    the gateway, and eagerly warm the box. `aiod up org/repo`."""
+    s = Settings.load()
+
+    # Resolve the profile either from --profile or from a bare `link` that names one.
+    prof = profiles.get(profile) if profile else profiles.get(link)
+    if profile and not prof:
+        console.print(f"[red]No profile '{profile}'.[/] See [bold]aiod profile list[/].")
+        raise typer.Exit(1)
+
+    if prof:
+        model = prof.model
+    else:
+        try:
+            model = parse_repo_id(link)
+        except ValueError as e:
+            console.print(f"[red]{e}[/]")
+            raise typer.Exit(1) from None
+
+    provider = (provider or (prof.provider if prof else "vast")).lower()
+    _require_provider_key(s, provider)
+
+    if was_token_minted(s) and persist_vllm_api_key(s.vllm_api_key):
+        console.print("[dim]persisted VLLM_API_KEY to ~/.config/aiod/.env[/]")
+
+    spin_kwargs = dict(
+        model=model,
+        quant=quant or (prof.quant if prof else "bf16"),
+        provider=provider,
+        max_price=max_price if max_price is not None else (prof.max_price if prof else None),
+        ttl_hours=ttl if ttl is not None else (prof.ttl_hours if prof else None),
+        idle_minutes=idle,
+        context=context if context is not None else (prof.context if prof else None),
+        concurrency=prof.concurrency if prof else 4,
+        tool_parser=prof.tool_call_parser if prof else None,  # None -> model_configs
+        extra_args=list(prof.extra_vllm_args) if prof else [],
+    )
+
+    # Wire CCR at the STABLE local gateway URL — never the rotating box — so CCR
+    # stops churning on every respin.
+    base = f"http://127.0.0.1:{port}/v1"
+    if write_ccr:
+        ccr.write_config(base, s.vllm_api_key, model)
+        console.print("[green]✓[/] CCR pointed at the local gateway. Run [bold]ccr restart && ccr code[/].")
+
+    console.print(
+        Panel(
+            f"model: [bold]{model}[/] ({spin_kwargs['quant']}) · provider: {provider} · "
+            f"idle-shutdown: {idle}m\n"
+            f"gateway: [bold]http://127.0.0.1:{port}[/]\n\n"
+            f"Next steps:\n"
+            f"  • [bold]ccr restart && ccr code[/]  (drive the model from Claude Code)\n"
+            f"  • [bold]aiod chat[/]                 (built-in chat UI)\n"
+            f"  • [bold]aiod status[/]               (live spin-up progress / cost)",
+            title="aiod up",
+            border_style="green",
+        )
+    )
+
+    if detach:
+        cmd = [
+            sys.executable, "-m", "aiod", "gateway",
+            "--model", model,
+            "--quant", spin_kwargs["quant"],
+            "--provider", provider,
+            "--idle", str(idle),
+            "--port", str(port),
+            "--no-ccr",  # already wired above; don't double-write
+        ]
+        # Forward the profile so the child rebuilds the SAME spin_kwargs —
+        # concurrency (feeds size_model/cost), tool_parser, and extra_vllm_args
+        # are profile-derived and have no standalone gateway flags.
+        prof_name = profile or (link if prof else None)
+        if prof_name:
+            cmd += ["--profile", prof_name]
+        if spin_kwargs["max_price"] is not None:
+            cmd += ["--max-price", str(spin_kwargs["max_price"])]
+        if spin_kwargs["ttl_hours"] is not None:
+            cmd += ["--ttl", str(spin_kwargs["ttl_hours"])]
+        if spin_kwargs["context"] is not None:
+            cmd += ["--context", str(spin_kwargs["context"])]
+        if anthropic:
+            cmd += ["--anthropic"]
+        if not no_spin:
+            cmd += ["--eager-spin"]  # match foreground: warm the box now, not on first request
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        console.print(f"[dim]gateway started in background (pid {proc.pid}). Polling /healthz…[/]")
+        if _poll_healthz(port):
+            console.print("[green]✓[/] gateway is up.")
+        else:
+            console.print("[yellow]gateway did not report healthy in time — check [bold]aiod status[/].[/]")
+        return
+
+    from .proxy import run_gateway
+
+    try:
+        run_gateway(
+            s, spin_kwargs, idle_minutes=idle, port=port,
+            enable_anthropic=anthropic, eager_spin=not no_spin,
+            on_event=lambda phase, msg: console.log(f"[{phase}] {msg}"),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Gateway stopped[/] — any running box is left up (aiod status/teardown).")
+
+
+def _poll_healthz(port: int, timeout: float = 30.0) -> bool:
+    """Poll the detached gateway's /healthz until it reports up (or times out)."""
+    import httpx
+
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/healthz"
+    while time.time() < deadline:
+        try:
+            r = httpx.get(url, timeout=2.0)
+            if r.status_code == 200 and r.json().get("status") == "up":
+                return True
+        except (httpx.HTTPError, ValueError):
+            pass
+        time.sleep(1.0)
+    return False
 
 
 @app.command()
